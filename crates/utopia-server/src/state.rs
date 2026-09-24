@@ -29,6 +29,8 @@ pub struct AppState {
     pub open_registration: bool,
     /// 强制 Secure cookie（配置项）；未强制时按请求的 X-Forwarded-Proto 逐次判定
     pub cookie_secure: bool,
+    /// 分块预算，见 `AppConfig::chunk_tokens`
+    pub chunk_tokens: usize,
     /// worker 并发数：调度循环每轮热读——系统设置改动即时生效
     pub worker_concurrency: Arc<std::sync::atomic::AtomicUsize>,
     /// 按模型的并发闸门：后台任务调 LLM 前取许可。限额存库，改完即时生效
@@ -58,7 +60,12 @@ impl AppState {
             blob,
             open_registration: cfg.open_registration,
             cookie_secure: cfg.cookie_secure,
-            worker_concurrency: Arc::new(std::sync::atomic::AtomicUsize::new(32)),
+            chunk_tokens: cfg.chunk_tokens,
+            // 与 `deployment_settings.worker_concurrency` 的列缺省保持一致（迁移 0011）：
+            // access::worker_concurrency 的「行不存在」兜底是 64，main.rs 的「函数本身
+            // 报错」兜底也是 64——这是**服务起来后第一次读这个值之前**的值，写错了
+            // 就意味着服务启动那一小会儿跑的是迁移 0011 想避免的并发不足。
+            worker_concurrency: Arc::new(std::sync::atomic::AtomicUsize::new(64)),
             model_gates: Arc::new(crate::llm_util::ModelGates::default()),
             events,
             live: Arc::new(crate::live::Registry::default()),

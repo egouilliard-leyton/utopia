@@ -1,27 +1,39 @@
 use sqlx::PgPool;
 use utopia_core::models::LlmSettings;
-use utopia_core::AppResult;
+use utopia_core::{secrets, AppError, AppResult};
 use uuid::Uuid;
 
+/// 出库即开封：四把 API key 在库里是封印的（`utopia_core::secrets`）。
+/// 任何返回 `LlmSettings` 的查询都从这里过
+fn opened(mut s: LlmSettings) -> AppResult<LlmSettings> {
+    s.chat_api_key = secrets::open_opt(s.chat_api_key.as_deref()).map_err(AppError::Other)?;
+    s.embed_api_key = secrets::open_opt(s.embed_api_key.as_deref()).map_err(AppError::Other)?;
+    s.ocr_api_key = secrets::open_opt(s.ocr_api_key.as_deref()).map_err(AppError::Other)?;
+    s.transcribe_api_key =
+        secrets::open_opt(s.transcribe_api_key.as_deref()).map_err(AppError::Other)?;
+    Ok(s)
+}
+
 pub async fn get(pool: &PgPool, workspace_id: Uuid) -> AppResult<Option<LlmSettings>> {
-    let row = sqlx::query_as("SELECT * FROM llm_settings WHERE workspace_id = $1")
-        .bind(workspace_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row)
+    let row: Option<LlmSettings> =
+        sqlx::query_as("SELECT * FROM llm_settings WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_optional(pool)
+            .await?;
+    row.map(opened).transpose()
 }
 
 /// 任取一个配了对话模型的工作区设置。给端点探针用：端点地址是部署共用的，
 /// 从哪个工作区的配置读到的都是同一个地方，而探针没有"当前工作区"这个上下文。
 pub async fn any_with_chat(pool: &PgPool) -> AppResult<Option<LlmSettings>> {
-    let row = sqlx::query_as(
+    let row: Option<LlmSettings> = sqlx::query_as(
         "SELECT * FROM llm_settings
          WHERE chat_base_url IS NOT NULL AND chat_model IS NOT NULL
          ORDER BY workspace_id LIMIT 1",
     )
     .fetch_optional(pool)
     .await?;
-    Ok(row)
+    row.map(opened).transpose()
 }
 
 /// upsert；api_key 传 None 表示保留旧值（前端不回传密钥）。
@@ -37,7 +49,10 @@ pub async fn upsert(
     embed_model: Option<&str>,
     embed_dim: Option<i32>,
 ) -> AppResult<LlmSettings> {
-    let row = sqlx::query_as(
+    // 入库即封印；None 仍是 None（保留旧值）
+    let chat_api_key = secrets::seal_opt(chat_api_key);
+    let embed_api_key = secrets::seal_opt(embed_api_key);
+    let row: LlmSettings = sqlx::query_as(
         "INSERT INTO llm_settings
              (workspace_id, chat_base_url, chat_api_key, chat_model,
               embed_base_url, embed_api_key, embed_model, embed_dim, updated_at)
@@ -63,5 +78,63 @@ pub async fn upsert(
     .bind(embed_dim)
     .fetch_one(pool)
     .await?;
-    Ok(row)
+    opened(row)
+}
+
+/// 版面识别服务的设置，单独存：它在管理页上是自己的一张卡片，存它不该碰对话和嵌入那几列
+/// （反过来也一样——`upsert` 不写这三列）。`api_key` 传 None 保留旧值；地址传 None = 关掉
+pub async fn upsert_ocr(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    backend: Option<&str>,
+) -> AppResult<LlmSettings> {
+    let api_key = secrets::seal_opt(api_key);
+    let row: LlmSettings = sqlx::query_as(
+        "INSERT INTO llm_settings (workspace_id, ocr_base_url, ocr_api_key, ocr_backend, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (workspace_id) DO UPDATE SET
+             ocr_base_url = EXCLUDED.ocr_base_url,
+             ocr_api_key  = COALESCE(EXCLUDED.ocr_api_key, llm_settings.ocr_api_key),
+             ocr_backend  = EXCLUDED.ocr_backend,
+             updated_at   = now()
+         RETURNING *",
+    )
+    .bind(workspace_id)
+    .bind(base_url)
+    .bind(api_key)
+    .bind(backend)
+    .fetch_one(pool)
+    .await?;
+    opened(row)
+}
+
+/// 转写模型的设置，跟版面识别服务一样单独存（管理页上各是一张卡片）
+pub async fn upsert_transcribe(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+) -> AppResult<LlmSettings> {
+    let api_key = secrets::seal_opt(api_key);
+    let row: LlmSettings = sqlx::query_as(
+        "INSERT INTO llm_settings
+             (workspace_id, transcribe_base_url, transcribe_api_key, transcribe_model, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (workspace_id) DO UPDATE SET
+             transcribe_base_url = EXCLUDED.transcribe_base_url,
+             transcribe_api_key  = COALESCE(EXCLUDED.transcribe_api_key, llm_settings.transcribe_api_key),
+             transcribe_model    = EXCLUDED.transcribe_model,
+             updated_at          = now()
+         RETURNING *",
+    )
+    .bind(workspace_id)
+    .bind(base_url)
+    .bind(api_key)
+    .bind(model)
+    .fetch_one(pool)
+    .await?;
+    opened(row)
 }

@@ -43,6 +43,8 @@ Both branches are protected: pull request required, CI (`backend` and `web`) mus
 
 Requires Docker, Rust 1.85+, Node 20+, pnpm.
 
+PDF text extraction also uses `pdftotext` when the Rust parser cannot read a file. Source installs need Poppler and its CJK CMap data (`poppler-utils poppler-data` on Debian); the Docker image includes both. Without them the PDF fallback test skips, and a PDF that draws text we cannot read reports a reader failure rather than claiming the file is a scan.
+
 ```bash
 docker compose up -d db                 # Postgres with pgvector
 cargo run -p utopia-server              # runs migrations, :1516
@@ -65,20 +67,46 @@ cd web && pnpm install --frozen-lockfile && pnpm build   # build type-checks
 This is the easiest thing to get wrong here. A green `cargo test --workspace` does not mean everything ran. A number of tests begin like this:
 
 ```rust
-let Ok(url) = std::env::var("UTOPIA_DATABASE_URL") else {
-    eprintln!("skipping: UTOPIA_DATABASE_URL not set");
+let Some(url) = utopia_store::test_db::url() else {
     return Ok(());
 };
 ```
+
+`test_db::url()` reads `UTOPIA_DATABASE_URL`. With `UTOPIA_TEST_REQUIRE_DB=1` also set, a missing database is a failure rather than a skip — that is how the `migrations` job in CI runs the whole `utopia-store` suite, so a green run there means the SQL was exercised. Use the same guard in new tests; do not read the env var directly.
 
 They guard what the compiler cannot see: table aliases inside SQL strings, how `NULL` behaves in a comparison, rows an `INNER JOIN` silently drops, whether a recursive CTE expands the same ancestor twice under diamond inheritance. `cargo check` and clippy say nothing about any of it.
 
 If you touched SQL under `crates/utopia-store/`, set it and run again:
 
 ```bash
-export UTOPIA_DATABASE_URL=postgres://utopia:utopia@localhost:5432/utopia
+# 1517 is the host-side port: docker-compose.yml deliberately avoids 5432
+# so a locally installed Postgres does not collide with the dev container.
+# Inside the compose network the app still talks to db:5432; 1517 is only
+# for code on the host reaching the container.
+export UTOPIA_DATABASE_URL=postgres://utopia:utopia@localhost:1517/utopia
 cargo test --workspace
 ```
+
+### Human phrase delivery regressions
+
+`human_phrase_materialization_delivery` exercises the real store and kills child
+processes at three commit boundaries. It starts the actual queue worker, so run
+it **only against a dedicated, otherwise idle test database**, separately from the
+workspace suite. Busy-lock coverage calls the private materialization body from
+`cfg(test)` and observes the existing production entry point waiting on the lock.
+These tests do not register an asynchronous production handler.
+
+```bash
+export UTOPIA_DATABASE_URL=postgres://.../dedicated_delivery_tests
+export UTOPIA_TEST_REQUIRE_DB=1
+cargo test --locked -p utopia-store --test human_phrase_materialization_delivery -- --ignored --skip crash_child --test-threads=1 --nocapture
+cargo test --locked -p utopia-store --lib materialize::delivery_tests::busy_defers_without_retaining_connections -- --ignored --test-threads=1 --nocapture
+```
+
+The first command explicitly runs both parents; the process-exit parent invokes
+`crash_child` itself and kills and waits for each child. Do not run that child by
+hand. See [0051](docs/decisions/0051-a-human-phrase-decision-carries-its-materialization-work.md)
+for the proposed delivery contract and remaining production acceptance.
 
 ## Things review will send back
 
@@ -110,7 +138,7 @@ Signed-off-by: Your Name <your@email>
 
 Forgot? `git commit --amend -s` for the last commit, or `git rebase --signoff HEAD~3` for several (adjust the count), then `git push -f`.
 
-Use a real name and a reachable email address.
+Use a consistent identity you answer to — a GitHub account with history under it counts — and an address that reaches you; a noreply address tied to that account is fine. No anonymous or throwaway contributions.
 
 ## License
 

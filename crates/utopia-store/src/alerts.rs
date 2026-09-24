@@ -51,6 +51,18 @@ pub mod kind {
     /// 哪些表——`query_data` 照样入列，模型却只能瞎猜列名。挂载那一刻的报错
     /// 只有点按钮的人看得见，此后这个库就一直这样静默地缺着。
     pub const SCHEMA_SYNC_FAILED: &str = "data_source.schema_sync_failed";
+    /// 库级：映射探索跑完了，一条口径都没提出来。`severity = info`，`min_role = editor`——
+    /// 不是故障，是"你在等的那件事没有结果"，而页面上没有别的地方能说这句话（#223）
+    pub const MAPPING_EXPLORATION_EMPTY: &str = "mapping.exploration_empty";
+    /// 库级：治理的保险丝跳了——七天内人撤回 agent 的自动合并两次，开关自动关掉
+    /// （0025 决定 9）。`severity = warning`，`min_role = editor`：裁重复项的人就是
+    /// 该去看 Agent 队列、决定要不要再打开的人
+    pub const GOVERNANCE_TRIPPED: &str = "governance.tripped";
+    /// 库级：一份文件的字要靠模型读（扫描件、图片要版面识别，录音要转写），而那种模型
+    /// 没配（0040）。`severity = warning`，`min_role = editor`：文件留着、文档停在 failed，
+    /// 在管理页「模型」里配上之后会自己重新处理。没有这一条，传上来的扫描件只是悄悄地
+    /// 什么都没有——0005 里一直空着的 `document.no_text_layer` 就是它
+    pub const DOCUMENT_NEEDS_READER: &str = "document.needs_reader";
 }
 
 /// 一次故障。打包成结构体不只是为了参数个数——调用点写 `severity: "error"`
@@ -212,7 +224,7 @@ pub async fn list_groups(
                 (array_agg(detail ORDER BY created_at DESC))[1:{GROUP_LINES}] AS lines
          FROM isl
          GROUP BY kb_id, kind, grp
-         ORDER BY max(created_at) DESC
+         ORDER BY max(created_at) DESC, kb_id, kind, grp
          LIMIT $6 OFFSET $7"
     );
     let items: Vec<AlertGroup> = sqlx::query_as(&sql)

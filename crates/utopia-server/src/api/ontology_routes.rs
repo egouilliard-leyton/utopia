@@ -138,6 +138,15 @@ pub async fn create_entity_type(
         json!({ "key": key, "label": req.label.trim() }),
     )
     .await;
+    // 本体多了一个类：类别词的绑定里那些「没有」和「没定」的要重判（0044 对齐第一片）
+    let _ = utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_types",
+        json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
+    )
+    .await;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -174,6 +183,15 @@ pub async fn update_entity_type(
         Some(id),
         json!({ "label": req.label.trim(), "color": req.color, "shape": req.shape,
                 "description": req.description }),
+    )
+    .await;
+    // 类的定义改了：绑到它的类别词过期，重判
+    let _ = utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_types",
+        json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
     )
     .await;
     Ok(Json(json!({ "ok": true })))
@@ -243,6 +261,9 @@ pub struct RelationTypeReq {
     /// 调用方（属性表单）不该因为一次改名就把 domain 清空
     #[serde(default)]
     pub domains: Option<Vec<Uuid>>,
+    /// 这条关系的边能带哪些属性（0037）：属性定义的 id。None = 不动
+    #[serde(default)]
+    pub qualifiers: Option<Vec<Uuid>>,
     /// 可以当宾语的类。只对 relation 有意义
     #[serde(default)]
     pub ranges: Option<Vec<Uuid>>,
@@ -303,6 +324,18 @@ pub async fn create_relation_type(
         req.unit.as_deref().map(str::trim).filter(|s| !s.is_empty()),
     )
     .await?;
+    if let Some(q) = req.qualifiers.as_deref() {
+        utopia_store::ontology::set_relation_qualifiers(&state.pool, kb_id, id, q).await?;
+    }
+    // 多了一个属性：判成 none / undecided 的签名也许对得上了（0044 对齐第二片）
+    utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_phrases",
+        serde_json::json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),
@@ -338,6 +371,18 @@ pub async fn update_relation_type(
         req.ranges.as_deref(),
     )
     .await?;
+    if let Some(q) = req.qualifiers.as_deref() {
+        utopia_store::ontology::set_relation_qualifiers(&state.pool, kb_id, id, q).await?;
+    }
+    // 属性改了定义或域/值域：绑到它的签名过期，判成 none 的也许对得上了
+    utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_phrases",
+        serde_json::json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),
@@ -371,6 +416,79 @@ pub async fn delete_relation_type(
     )
     .await;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 一条谓词的一端挂着两个以上开放值的持有者（#341）。
+///
+/// 本体自己长出来的库里没人声明过唯一性，接任不会闭合前任，三个人同时在管
+/// 一个项目——而「谁在管」正是这个产品的题。引擎永不自动推断 functional
+/// （bootstrap_ontology.rs 写了为什么），所以它只能被**问**：这里把证据摆出来
+/// ——哪条谓词、哪一端、多少持有者、对账会闭合几条、几条要进人审——人决定。
+/// `declared` 为真的那些是声明了却还没对过账的（导入的、声明之前就在的）。
+pub async fn uniqueness_candidates(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(kb_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    let cands = utopia_store::temporal::uniqueness_candidates(&state.pool, kb_id).await?;
+    let items: Vec<serde_json::Value> = cands
+        .iter()
+        .map(|c| {
+            json!({
+                "predicate_id": c.predicate_id,
+                "key": c.key,
+                "label": c.label,
+                "kind": c.kind,
+                "side": c.side,
+                "axiom": if c.side == "subject" { "functional" } else { "inverse_functional" },
+                "declared": c.declared,
+                "holders": c.holders,
+                "open_facts": c.open_facts,
+                "would_close": c.would_close,
+                "would_review": c.would_review,
+                "examples": c.examples.iter().map(|e| json!({
+                    "holder": e.holder,
+                    "values": e.values.iter().map(|v| json!({
+                        "fact_id": v.fact_id,
+                        "name": v.name,
+                        "valid_from": v.valid_from.map(|t| t.to_rfc3339()),
+                        "confidence": v.confidence,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "candidates": items })))
+}
+
+/// 补上声明之后，把这条谓词已经在账上的开放行对一遍（#341）。
+///
+/// 与落库时同一条路：作废 + 改写，supersedes 链回旧行，记录轴倒回声明之前
+/// 仍看得见原来的行；拿不准的进人审。谓词没有唯一性声明时拒绝——
+/// 声明是人的事，这里只执行。响应里报闭合了几条、几条进了人审。
+pub async fn reconcile_relation_type(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((kb_id, id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_kb(&state, &user, kb_id, Role::Editor).await?;
+    let report = utopia_store::temporal::reconcile_predicate(&state.pool, kb_id, id).await?;
+    let _ = utopia_store::audit::record(
+        &state.pool,
+        Some(kb_id),
+        user.id,
+        "relation_type.reconciled",
+        "relation_type",
+        Some(id),
+        json!({ "corrected": report.corrected.len(), "conflicts": report.conflicts }),
+    )
+    .await;
+    Ok(Json(json!({
+        "corrected": report.corrected.len(),
+        "conflicts": report.conflicts,
+        "corrected_ids": report.corrected,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1006,7 +1124,12 @@ pub async fn adopt_predicate(
     // 这里的 forms 是人在面板上勾的，完全可能同时勾了 `produced` 和 `produced_by`，
     // 而一个 swap 标志伺候不了混合。自动那条路不存在这个问题：同组说法共享屈折基，
     // 结尾有没有 `by` 必然一致。真要修得让 adopt 逐条判方向，那是另一件事。
-    let (batch_id, remapped) = utopia_store::graph::adopt_proposed_predicates(
+    let utopia_store::graph::Adopted {
+        batch_id,
+        moved: remapped,
+        left_off,
+        corrected,
+    } = utopia_store::graph::adopt_proposed_predicates(
         &state.pool,
         kb_id,
         predicate_id,
@@ -1027,14 +1150,16 @@ pub async fn adopt_predicate(
         Some(predicate_id),
         json!({
             "key": key, "label": req.label, "forms": req.forms,
-            "facts_remapped": remapped, "batch": batch_id,
+            "facts_remapped": remapped, "facts_left_off": left_off,
+            "facts_direction_corrected": corrected, "batch": batch_id,
         }),
     )
     .await;
     state.emit_review(kb_id);
-    Ok(Json(
-        json!({ "id": predicate_id, "remapped": remapped, "batch": batch_id }),
-    ))
+    Ok(Json(json!({
+        "id": predicate_id, "remapped": remapped, "left_off": left_off,
+        "corrected": corrected, "batch": batch_id,
+    })))
 }
 
 /// 撤销一次采纳：新写的行作废、旧行复活。关系类型留着（有事实指向过它，
@@ -1311,6 +1436,43 @@ pub(crate) struct AttributeAdopted {
 }
 
 /// 建（或指向已有的）属性，并把等着它的字面值事实改挂过去。人工与自动共用。
+/// 等着这个说法的值**是不是清一色的量**；是的话给出它们共同的单位。
+///
+/// 判据要全体一致：混着 `$12 billion` 与 `chief executive` 的一批，
+/// 按 number 落地会把后者整条丢掉（换不动的不改写），那不如老实当 text。
+fn quantity_shape(facts: &[(Uuid, Option<Uuid>, serde_json::Value)]) -> Option<String> {
+    if facts.is_empty() {
+        return None;
+    }
+    let mut unit: Option<String> = None;
+    let mut agreed = true;
+    for (_, _, v) in facts {
+        let raw = v.get("value").unwrap_or(v);
+        let hit = match raw {
+            serde_json::Value::Number(_) => Some((0.0, None)),
+            serde_json::Value::String(s) => utopia_extract::parse_leading_quantity(s),
+            _ => None,
+        }?;
+        // 抽取那一步单记的单位更可信（`$5 billion` → `$`），没有再退回解出来的
+        let u = v
+            .get("unit")
+            .and_then(|u| u.as_str())
+            .map(str::to_string)
+            .or(hit.1);
+        match (&unit, u) {
+            (None, Some(u)) => unit = Some(u),
+            (Some(a), Some(b)) if *a != b => agreed = false,
+            _ => {}
+        }
+    }
+    // 全体都是量才走到这里；单位不一致就当没有单位，别挑一个塞上去
+    Some(if agreed {
+        unit.unwrap_or_default()
+    } else {
+        String::new()
+    })
+}
+
 pub(crate) async fn adopt_attribute_core(
     state: &AppState,
     kb_id: Uuid,
@@ -1327,7 +1489,10 @@ pub(crate) async fn adopt_attribute_core(
     } else {
         // **domain 从数据里取。** 属性必须声明能挂在哪些类下，猜错的代价是硬的：
         // 主语类型对不上就整条丢弃。这些事实的主语现在是什么类是事实，不是判断
-        let mut domains: Vec<Uuid> = facts.iter().map(|(_, type_id, _)| *type_id).collect();
+        let mut domains: Vec<Uuid> = facts
+            .iter()
+            .filter_map(|(_, type_id, _)| *type_id)
+            .collect();
         domains.sort_unstable();
         domains.dedup();
         if domains.is_empty() {
@@ -1336,7 +1501,16 @@ pub(crate) async fn adopt_attribute_core(
                 "nothing is waiting on those wordings",
             ));
         }
-        utopia_store::ontology::create_relation_type(
+        /* **datatype 由等着的那些值定，不听模型的。**
+        实测模型给 `valuation` 报的是 text，而等它的四个值全是
+        `$12 billion` 这样的量；存成 text 就比不了大小——而"能比大小"
+        正是这些数不该当节点的理由。手里有事实的时候不必去问判断题，
+        `keep_forms` 那里已经是同一个原则。
+        单位同理：几条值的单位一致就落在属性上（`$`、`%`、`people`）。 */
+        let inferred = quantity_shape(&facts);
+        let datatype = inferred.as_ref().map_or(spec.datatype, |_| "number");
+        let unit = inferred.as_deref().filter(|u| !u.is_empty()).or(spec.unit);
+        match utopia_store::ontology::create_relation_type(
             &state.pool,
             kb_id,
             spec.key,
@@ -1349,10 +1523,34 @@ pub(crate) async fn adopt_attribute_core(
             "attribute",
             &domains,
             &[],
-            Some(spec.datatype),
-            spec.unit,
+            Some(datatype),
+            unit,
         )
-        .await?
+        .await
+        {
+            Ok(id) => id,
+            /* 键被一个**空的**同名关系占着：改判它，别放弃。
+            实测就是这么卡住的——`Relation key 'valuation' already exists`，
+            然后 valuation 那几个数额永远没有谓词，而那条关系自己一条事实
+            都没有。有事实的不会被改判（判据在 store 那一侧的 SQL 里），
+            那种是本体与语料的真分歧，照旧报错留给人看 */
+            Err(e) => match utopia_store::ontology::attribute_from_unused_relation(
+                &state.pool,
+                kb_id,
+                spec.key,
+                &domains,
+                datatype,
+                unit,
+            )
+            .await?
+            {
+                Some(id) => {
+                    tracing::info!(%kb_id, key = spec.key, "空关系改判成属性");
+                    id
+                }
+                None => return Err(e),
+            },
+        }
     };
 
     // 换算按**库里那一条**的 datatype，不按请求——指向已有属性时请求里根本
@@ -1366,14 +1564,27 @@ pub(crate) async fn adopt_attribute_core(
         // 抽取写进去的形状是 {"value": …}，取里面那一层来换算
         let raw = object_value.get("value").unwrap_or(object_value);
         match utopia_extract::normalize_attr_value(&datatype, raw) {
-            Some(v) => rewrites.push((*fact_id, json!({ "value": v }))),
+            // **单位跟着值走**。抽取那一步把 `$5 billion` 的 `$` 单记了一格
+            // （见 extraction 里那段说明）；换算成 5e9 之后符号丢掉的话，
+            // 剩下的数就不知道是钱还是别的什么了
+            Some(v) => {
+                let mut next = json!({ "value": v });
+                if let Some(u) = object_value.get("unit") {
+                    next["unit"] = u.clone();
+                }
+                rewrites.push((*fact_id, next))
+            }
             // 换不动的**不改写**：宁可让它继续没有谓词，等下一次，
             // 也不把一个换不动的值硬塞进类型化的属性里
             None => unconvertible += 1,
         }
     }
-    let (batch_id, remapped) =
-        utopia_store::graph::adopt_value_facts(&state.pool, kb_id, attribute_id, &rewrites).await?;
+    // 属性那一路没有签名可判（宾语是字面值），`left_off` 恒为 0
+    let utopia_store::graph::Adopted {
+        batch_id,
+        moved: remapped,
+        ..
+    } = utopia_store::graph::adopt_value_facts(&state.pool, kb_id, attribute_id, &rewrites).await?;
     for form in spec.forms {
         let _ =
             utopia_store::ontology::clear_miss(&state.pool, kb_id, "attribute_type", form).await;

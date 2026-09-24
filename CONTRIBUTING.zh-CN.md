@@ -43,6 +43,8 @@ git push -u origin fix/some-thing
 
 依赖：Docker、Rust 1.85+、Node 20+、pnpm。
 
+Rust 解析器读不了的 PDF 会交给 `pdftotext`。源码部署还需要安装 Poppler 及中文 CMap 数据（Debian：`poppler-utils poppler-data`）；Docker 镜像已包含两者。没装的话那个 PDF 回退测试会跳过；这时一份画了字却读不出来的 PDF 会报读取失败，而不会谎称它是扫描件。
+
 ```bash
 docker compose up -d db                 # pgvector 版 Postgres
 cargo run -p utopia-server              # 自动跑迁移，:1516
@@ -73,10 +75,14 @@ let Ok(url) = std::env::var("UTOPIA_DATABASE_URL") else {
 
 它们守的是**编译器看不见的东西**：SQL 里的表别名、`NULL` 参与比较时的行为、`INNER JOIN` 悄悄滤掉的行、递归 CTE 在菱形继承下会不会把同一个祖先展开两次。`cargo check` 和 clippy 对这些一个字都不说。
 
-碰了 `crates/utopia-store/` 里的 SQL，请把它设上再跑一遍：
+碰了 `crates/utopia-store/` 里的 SQL，请把它设上再跑一遍。库要先迁移好——绝大多数连库测试不自己跑迁移，对着空库直接跑会成片报 relation does not exist：
 
 ```bash
-export UTOPIA_DATABASE_URL=postgres://utopia:utopia@localhost:5432/utopia
+# 1517 是宿主机侧端口：docker-compose.yml 显式避开 5432，以免和本地已经
+# 跑着的 PG 撞上。容器内仍是 5432，app 在 compose 网络里走 db:5432；
+# 这条 1517 只给宿主机上跑的代码连容器用。
+export UTOPIA_DATABASE_URL=postgres://utopia:utopia@localhost:1517/utopia
+cargo run -p utopia-store --example migrate   # 空库先迁移；CI 的 backend job 也是这么做的
 cargo test --workspace
 ```
 

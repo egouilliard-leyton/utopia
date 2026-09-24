@@ -1,8 +1,10 @@
+import { Button, CARD_ACTIONS, Status } from "../ui";
 /* 等人点头的事实（docs/decisions/0015）。
    一句 remember 抽出的三元组先进待确认队列，不上图；人在这里点头它才进账本。
    **原句在上，三元组在下**：只列三元组等于要人凭空判断它对不对——
    实测里 `Acme --?--> 深圳` 那条，人一看原句就知道该拒。
    两处共用同一行组件：Review 页的「待确认」一档，与 Chat 里跟在 remember 步骤后面的那张卡。 */
+import { fmtObjectValue } from "../objectValue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type PendingFactItem } from "../api";
 import { S } from "../i18n";
@@ -20,11 +22,7 @@ function sentence(quote: string): string {
 
 function objectText(f: PendingFactItem): string {
   if (f.object_name) return f.object_name;
-  const v = f.object_value;
-  if (!v) return "?";
-  if (v.summary) return v.summary;
-  const val = v.value === undefined || v.value === null ? "?" : String(v.value);
-  return v.unit ? `${val} ${v.unit}` : val;
+  return fmtObjectValue(f.object_value as Record<string, unknown> | null) ?? "?";
 }
 
 /** 点头是写图的动作，Editor 起步——与服务端 `require_kb(Role::Editor)` 同一口径。
@@ -54,21 +52,33 @@ export function PendingFactRow({
 }) {
   const from = ym(fact.valid_from);
   const to = ym(fact.valid_to);
-  const range = from || to ? `${from ?? "…"} → ${to ?? S.review.ongoing}` : null;
+  // 开放陈述（0044）带的是照抄的时间词，不是算出来的区间：有词就显示词
+  const timeWords = (fact.time_words ?? []).map((t) => t.text).join(" · ");
+  const range = timeWords
+    ? timeWords
+    : from || to
+      ? `${from ?? "…"} → ${to ?? S.review.ongoing}`
+      : null;
+  const qualifiers = fact.qualifiers ?? [];
   return (
-    <div className="glass rounded-xl p-4">
+    <div className="glass rounded-panel p-4">
       {/* 原句先出。它是人自己说的，判断的依据就是它 */}
-      <p className="text-xs text-neutral-400 italic">“{sentence(fact.quote)}”</p>
-      <div className="mt-2.5 flex items-center gap-2 flex-wrap">
-        <span className="text-sm font-medium text-white">{fact.subject_name}</span>
-        <span className="text-xs text-neutral-500">
+      <p className="text-small text-ink-2 italic">“{sentence(fact.quote)}”</p>
+      <div className="mt-3 flex items-center gap-2 flex-wrap">
+        <span className="text-body font-medium text-ink">{fact.subject_name}</span>
+        <span className="text-small text-ink-2">
           —{" "}
           {fact.predicate_label ? (
             <span>{fact.predicate_label}</span>
+          ) : fact.phrase ? (
+            /* 开放陈述：文档自己的话，斜体标明它是原话而不是词表里的词（0044） */
+            <span className="italic text-ink-2" title={S.review.pendingOwnWords}>
+              {fact.phrase}
+            </span>
           ) : (
             /* 本体里没有这个关系：显示原话，斜体标明它不是词表里的词（0010） */
             <span
-              className="italic text-neutral-600"
+              className="italic text-ink-2"
               title={S.review.pendingNoPredicate}
             >
               {fact.proposed_predicate ?? S.graph.unknownPredicate}
@@ -76,35 +86,51 @@ export function PendingFactRow({
           )}{" "}
           →
         </span>
-        <span className="text-sm font-medium text-white">{objectText(fact)}</span>
-        {range && <span className="text-xs text-neutral-500">({range})</span>}
-        {!fact.predicate_label && (
-          <span className="u-chip u-chip-warn ml-auto">{S.review.pendingNoPredicateChip}</span>
+        <span className="text-body font-medium text-ink">{objectText(fact)}</span>
+        {range && <span className="text-small text-ink-2">({range})</span>}
+        {!fact.predicate_label && !fact.phrase && (
+          <Status tone="warn" className="ml-auto shrink-0">
+            {S.review.pendingNoPredicateChip}
+          </Status>
         )}
       </div>
-      <div className="mt-3 flex items-center gap-2">
-        {fact.proposed_by_name && (
-          <span className="text-[11px] text-neutral-600">
-            {S.review.pendingSaidBy(fact.proposed_by_name)}
-          </span>
-        )}
+      {qualifiers.length > 0 && (
+        /* 限定按文档的角色词挂着（0044）：金额、对象、比较基准 */
+        <div className="mt-2 flex flex-wrap gap-1">
+          {qualifiers.map((q) => (
+            <span key={q.role} className="rounded-full bg-surface-2 px-2 py-1 text-fine text-ink-2">
+              {q.role}: {q.entity_name ?? String(q.value ?? "")}
+            </span>
+          ))}
+        </div>
+      )}
+      {/* 与审阅页其余六种卡同一副页脚（CARD_ACTIONS）：动作在左，「谁说的」推到右边 */}
+      <div className={CARD_ACTIONS}>
         {canDecide && (
-          <div className="ml-auto flex gap-2">
-            <button
-              className="u-btn u-btn-ghost px-3 py-1.5 text-xs text-[var(--u-danger)]"
-              disabled={busy}
-              onClick={onReject}
-            >
-              {S.review.reject}
-            </button>
-            <button
-              className="u-btn u-btn-ghost px-3 py-1.5 text-xs"
+          <>
+            <Button variant="secondary" size="sm"
               disabled={busy}
               onClick={onConfirm}
             >
               {S.review.confirm}
-            </button>
-          </div>
+            </Button>
+            <Button variant="danger" size="sm"
+              disabled={busy}
+              onClick={onReject}
+            >
+              {S.review.reject}
+            </Button>
+          </>
+        )}
+        {fact.proposed_by_name && (
+          <span className="ml-auto truncate text-fine text-ink-2">
+            {fact.proposed_token_name
+              ? S.review.pendingSaidVia(
+                  fact.proposed_by_name,
+                  fact.proposed_token_name,
+                )
+              : S.review.pendingSaidBy(fact.proposed_by_name)}
+          </span>
         )}
       </div>
     </div>
@@ -134,7 +160,7 @@ export function NodCard({ kbId, chunkId }: { kbId: string; chunkId: string }) {
   if (items.length === 0) return null;
   return (
     <div className="my-2 space-y-2">
-      <div className="text-xs text-neutral-500">{S.review.nodCardTitle(items.length)}</div>
+      <div className="text-small text-ink-2">{S.review.nodCardTitle(items.length)}</div>
       {items.map((f) => (
         <PendingFactRow
           key={f.id}

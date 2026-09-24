@@ -20,6 +20,8 @@
 [![Built by DeepLethe](https://img.shields.io/badge/BUILT%20BY-DEEPLETHE-2D333B?style=flat-square&labelColor=161B22)](https://github.com/deeplethe)
 [![English](https://img.shields.io/badge/LANG-ENGLISH-DA3633?style=flat-square&labelColor=161B22)](README.md)
 
+<a href="https://trendshift.io/repositories/159739?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-159739" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/159739/daily?language=Python" alt="deeplethe%2Futopia | Trendshift" width="250" height="55"/></a>  <a href="https://trendshift.io/repositories/159739?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-159739" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/159739/weekly?language=Python" alt="deeplethe%2Futopia | Trendshift" width="250" height="55"/></a>
+
 </div>
 
 **由 [DeepLethe 深纪元](https://deeplethe.com) 构建的企业知识世界模型。** 它是首个基于本体的被动学习、自我治理的开源知识工程基座——有别于知识图谱或向量知识库，该项目将时间感知与本体论融入了系统底层，根据传入的语料演进知识体系，基于本体论进行冲突检测、知识推理、智能决策。支持离线部署，快速建立企业知识基座、可信决策中枢、合规审计中枢，推进企业的智能化落地。
@@ -53,15 +55,17 @@ https://github.com/user-attachments/assets/aa226443-75de-437e-bd80-88e592ed8457
 | 能力 | 亮点 |
 | --- | --- |
 | **完整应用** | 系统控制台 · 图谱浏览器 · 在线本体工作台 · 开箱即用 |
-| **文档接入** | 支持多种文档（pdf、md、html、ppt、word、excel）· 支持自定义订阅更新与定时同步（JIRA、飞书正在支持中） |
+| **文档接入** | 支持多种文档（pdf、md、html、ppt、word、excel）· 网页、RSS、GitHub、Jira、Notion、WebDAV、S3 兼容存储定时同步 |
 | **混合检索** | Tantivy · pgvector 向量 · RRF 融合 · chunk 溯源 |
-| **双时态图谱** | 知识时态+溯源时态 · 支持任意时刻图谱 · 知识变更链 |
+| **双时态图谱** | 知识时态+溯源时态 · 支持任意时刻图谱 · 知识变更链 · 边节点化 |
 | **AgentHarness · AgenticRAG** | 应用本身具备 harness 能力，可通过对话调用系统完整功能 · 内置智能体包含多种工具，支持多轮工具调用与对话 |
+| **MCP 接入** | 提供 MCP server，允许 Claude Desktop、Cursor、Workbuddy 等 agent 框架接入，支持细粒度权限控制 |
 | **内置本体包** | 内置 schema.org · W3C Org · PROV-O · FOAF · IOF Core · 不断扩展中 · [我想申请对自己的行业进行额外支持](https://github.com/deeplethe/utopia/issues/new?labels=enhancement&title=Ontology%20pack%20request) |
 | **语义抽取** | 实体、关系与时间归一化 · 事实强制带证据引句 · 向量与本体召回加 LLM 裁决自动消歧，可追溯可撤销 · 随文本自动提出本体修订方案 |
 | **知识派生与推理** | 时态 Datalog · 前向链 · 本体公理编译 · 派生路径追溯 · 基于 Rust 自建轻量推理引擎 |
 | **冲突检测** | 时态冲突 · 自反、反对称、传递环、基数违规 · 本体自身缺陷 · 可撤事实、可改公理、可认可并存 |
 | **人工审核与审计台账** | 低置信抽取、待合并候选自动进入审核队列 · 记录每一次操作的用户、时间、变更快照，用于合规审计 |
+| **Agent 自动裁决** | Agent 基于常识和业务文档自动进行裁决，低置信裁决会进入人工审核队列，人的决策会被记录，用于调优 Agent，形成反馈进化 |
 | **智能映射与问数** | 选定数据库和知识库，智能体自动探索并建立映射关系 · 基于 Ontology2SQL 的问数 · [在 BIRD Mini-Dev 上取得 SOTA（最佳成绩）](https://github.com/bird-bench/bird-bench.github.io/pull/218) |
 | **模型接入** | 任何 OpenAI 兼容端点 · 支持本地部署模型 |
 | **多用户多知识库** | 以知识库为单位的角色与权限设计，支持系统管理员、用户，知识库管理、编辑、访问权限分级 |
@@ -79,7 +83,9 @@ cd utopia
 docker compose --profile app up -d
 ```
 
-打开 http://localhost:1516 注册 —— 第一个账户自动成为管理员，同时系统会创建所有人可读的公共知识库。抽取业务文档前，请先在系统设置里配置模型端点（chat 与 embedding）。
+打开 http://localhost:1516 注册 —— 第一个账户自动成为管理员，同时系统会创建所有人可读的公共知识库。抽取业务文档前，请先在「管理 → 模型」里配置模型端点（chat 与 embedding）。
+
+数据库口令（`.env` 里的 `UTOPIA_DB_PASSWORD`，默认 `utopia`）在数据卷首次初始化时写入。已经跑起来的部署要改口令，得同时改库里那份——`docker compose exec db psql -U utopia -c "ALTER USER utopia PASSWORD '<新口令>'"`——或者 `docker compose --profile app down -v` 从头来过（会删掉全部数据）。
 
 或者从源码构建：
 
@@ -103,9 +109,10 @@ cd web && pnpm install && pnpm dev
 ## 路线图
 
 - [ ] **决策推理**：计算约束条件，决策复盘
+- [ ] **业务规则**：由人写下、作用于实体属性事实的规则（阈值、类别集合），把实体归类为一条带前提的派生事实，规则与前提就是它的解释（[#277](https://github.com/deeplethe/utopia/issues/277)）
 - [ ] **执行校验层**：对 Agent 的调用进行本体规则与符号逻辑校验
 - [ ] **问数与映射添加数据湖仓支持**：Iceberg / Delta Lake，以及 Databricks、Snowflake、MaxCompute 的映射探索与 Ontology2SQL 支持
-- [ ] **更多数据源**：MySQL、ClickHouse、Doris 驱动，S3、WebDAV、Notion、飞书连接器
+- [ ] **更多数据源**：ClickHouse 驱动，飞书连接器
 - [ ] **精确到时刻**：在年 / 月 / 日之外加一档 `instant` 精度，给那些本来就带时间戳的来源——现在连接器按 UTC 截到天，跨午夜的事件会差一天
 - [ ] **MCP 上的 Agent 记忆**：补齐 episodes 写入、retrieve 端点与 MCP 服务器
 - [ ] **企业化**：OIDC SSO、备份恢复命令、10 万文档级别的性能基准

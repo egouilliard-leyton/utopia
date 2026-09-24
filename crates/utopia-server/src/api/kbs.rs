@@ -44,6 +44,17 @@ pub struct UpdateKbReq {
     /// 多久重推一次（分钟）。事实持续在变，只靠手点会让派生一直是缺的
     #[serde(default)]
     pub inference_interval_minutes: Option<i32>,
+    /// 抽取结束自动排一轮类型消解（缺省开）。见 docs/decisions/0016 C2
+    #[serde(default)]
+    pub auto_type_resolution: Option<bool>,
+    /// 治理开关（缺省关）：开着，agent 按先进先出过等人的重复对，先读台账再裁；
+    /// 打开那一刻就排一轮，关掉后任务在两簇之间看到就停。见 docs/decisions/0025
+    #[serde(default)]
+    pub governance: Option<bool>,
+    /// 人写的数据约定（「测试单不算数」这类 schema 里没有的规则），问数与探索的
+    /// 提示词都读它。探索生成的描述在另一个字段，PATCH 不了。见 #570
+    #[serde(default)]
+    pub data_conventions: Option<String>,
 }
 
 /// 用户可见的 KB 列表（restricted 库仅矩阵成员与系统管理员可见）。
@@ -97,6 +108,9 @@ pub async fn create(
             None,
             None,
             Some(v),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -180,8 +194,16 @@ pub async fn update(
         req.ontology_lang.as_deref(),
         req.materialize_inferences,
         req.inference_interval_minutes,
+        req.auto_type_resolution,
+        req.governance,
+        req.data_conventions.as_deref().map(str::trim),
     )
     .await?;
+    // 打开开关就自动开始处理：排一轮，同库已排着的不重复
+    if req.governance == Some(true) {
+        utopia_store::jobs::enqueue_unless_queued(&state.pool, "govern", json!({ "kb_id": id }))
+            .await?;
+    }
     // 审计只记不阻断
     let _ = utopia_store::audit::record(
         &state.pool,
@@ -190,7 +212,13 @@ pub async fn update(
         "kb.updated",
         "kb",
         Some(id),
-        json!({ "name": req.name, "visibility": req.visibility }),
+        // 约定改了要留痕：那段文字进每一次问数的提示词，谁什么时候改过得查得到
+        json!({
+            "name": req.name,
+            "visibility": req.visibility,
+            "governance": req.governance,
+            "data_conventions": req.data_conventions.is_some(),
+        }),
     )
     .await;
     Ok(Json(kb))
@@ -215,6 +243,19 @@ pub async fn delete(
     )
     .await;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// 这个库走到哪一步了（#313）：四个页面的空状态共用同一个判断。
+///
+/// Viewer 起步——看得见这个库的人都该知道它是空的还是在跑。回的全是布尔与
+/// 计数，模型那一项只说配没配，所以不需要工作区 admin 那道门。
+pub async fn readiness(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<utopia_core::models::Readiness>> {
+    kb_with_role(&state, &user, id, Role::Viewer).await?;
+    Ok(Json(utopia_store::kbs::readiness(&state.pool, id).await?))
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +391,10 @@ pub async fn audit_log(
 /// **一个包失败不回滚已装的**：本体是加法，装了一半的库仍然可用，
 /// 而回滚要撤已经建好的类——那正是 0008 决定不做导入撤销的理由。
 /// 失败信息里带上是哪个包，让人知道从哪补。
-async fn install_packs(
+///
+/// 没有默认包（#580）：注册建的 General 库与对话框里新建的库都空着起步，
+/// 装哪个包是建库的人选的。
+pub(super) async fn install_packs(
     state: &AppState,
     kb_id: Uuid,
     actor: Uuid,
@@ -359,13 +403,29 @@ async fn install_packs(
     if pack_ids.is_empty() {
         return Ok(());
     }
+    let mut packs = Vec::with_capacity(pack_ids.len());
     for id in pack_ids {
         let pack = crate::ontology_packs::get(id)
             .ok_or_else(|| AppError::invalid("unknown_pack", format!("未知的本体包：{id}")))?;
-        let bytes = crate::ontology_packs::bytes(pack)?;
-        crate::owl_import::apply(state, kb_id, actor, pack.filename, &bytes)
+        packs.push((pack, crate::ontology_packs::bytes(pack)?));
+    }
+    for (pack, bytes) in &packs {
+        crate::owl_import::apply(state, kb_id, actor, pack.filename, bytes)
             .await
             .map_err(|e| AppError::Other(anyhow::anyhow!("装本体包 {} 失败：{e}", pack.id)))?;
+    }
+    // 第二遍：跨包的 domain / range。包是挨个装的，先装的看不见后装的类——
+    // W3C Org 的 headOf 要等 FOAF 的 Agent（#222）。只装一个包时没有"别的包"
+    if packs.len() > 1 {
+        for (pack, bytes) in &packs {
+            let (d, r) =
+                crate::owl_import::relink_domains_ranges(state, kb_id, pack.filename, bytes)
+                    .await
+                    .map_err(|e| {
+                        AppError::Other(anyhow::anyhow!("补本体包 {} 的签名失败：{e}", pack.id))
+                    })?;
+            tracing::debug!(%kb_id, pack = pack.id, domains = d, ranges = r, "跨包签名补链");
+        }
     }
     Ok(())
 }

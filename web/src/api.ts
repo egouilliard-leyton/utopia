@@ -1,3 +1,4 @@
+import type { SourceKind } from "./sourceKinds";
 import { S, lang } from "./i18n";
 
 export class ApiError extends Error {
@@ -104,6 +105,13 @@ export interface Kb {
   /** 把推出来的事实写进账本（R1）。**缺省关**——推理往图里加东西，
    *  而声明可能是错的，不该在用户没表态时就按它改图 */
   materialize_inferences: boolean;
+  /** 抽取结束自动排一轮类型消解（只自动落地子树内精化的那一档） */
+  auto_type_resolution: boolean;
+  /** 治理开关（0025，缺省关）：agent 按先进先出过等人的重复对，先读台账里人的
+   *  先例再裁；打开就开始，关掉就停 */
+  governance: boolean;
+  /** 这次打开治理的时刻；保险丝只数它之后的撤回 */
+  governance_since: string | null;
   /** 多久重推一次（分钟）。事实持续在变，只靠手点会让派生一直是缺的 */
   inference_interval_minutes: number;
   /** 上次推完的时间 */
@@ -132,6 +140,8 @@ export interface AuditEvent {
   target_kind: string;
   target_id: string | null;
   detail: Record<string, unknown>;
+  /** null = 引擎自动（裁决器、一致性检查、推理）；有 id 没名字 = 账号已移除 */
+  actor_id: string | null;
   actor_name: string | null;
   created_at: string;
 }
@@ -161,6 +171,12 @@ export interface Doc {
    *  `migrations/0002_ingest.sql` 的 `tags` 列上 */
   tags: string[];
   missing_since: string | null;
+  /** 墓碑（#268）：删了但留着，可撤销 */
+  deleted_at: string | null;
+  /** 真删过：内容没了，回不来 */
+  purged_at: string | null;
+  /** 这份文件的字要靠哪一种模型读、而那种模型没配（0040）：ocr / transcribe；文档此时是 failed */
+  reader_needed: "ocr" | "transcribe" | null;
   created_at: string;
 }
 
@@ -177,25 +193,12 @@ export interface ExtractionDrop {
 
 export interface SourceView {
   id: string;
-  kind:
-    | "folder"
-    | "url"
-    | "rss"
-    | "api"
-    | "custom"
-    | "github_issues"
-    | "jira_issues"
-    | "s3"
-    | "azure_blob"
-    | "gcs"
-    | "webdav"
-    | "notion"
-    | "memory"
-    | "upload";
+  kind: SourceKind;
   name: string;
   config: {
     urls?: string[];
     feed_url?: string;
+    content_mode?: "feed" | "full_new_items";
     endpoint?: string;
     /** github_issues：owner/name */
     repo?: string;
@@ -205,6 +208,8 @@ export interface SourceView {
     base_url?: string;
     /** jira_issues：项目 key，如 KAFKA */
     project?: string;
+    /** false = 这个来源下的文档只检索、不抽取（schema 文档，0035 决定 7）；缺省抽取 */
+    extract?: boolean;
   } | null;
   icon: string | null;
   sync_interval_minutes: number | null;
@@ -215,6 +220,21 @@ export interface SourceView {
   last_sync_added: number;
   doc_count: number;
   missing_count: number;
+  /** 全文补全那一块；**不是 RSS 全文来源的就是 null**，不用再拿 kind 与
+   *  content_mode 自己推一遍适不适用（0026 / #417） */
+  rss_full_content: RssFullContentSummary | null;
+}
+
+/** 一个 RSS 来源当前代的全文补全进度。五个计数一起读，所以一起给。 */
+export interface RssFullContentSummary {
+  state: "pending" | "active" | "disabled";
+  pending: number;
+  /** queued 与 hydrating 合成一格 */
+  queued: number;
+  retrying: number;
+  complete: number;
+  /** terminal、deleted、superseded 合成一格 */
+  terminal: number;
 }
 
 export interface SearchResult {
@@ -225,6 +245,15 @@ export interface SearchResult {
   filename: string;
 }
 
+/** 这个库走到哪一步了（#313）。凭据不出库：模型那项只说配没配 */
+export interface Readiness {
+  has_chat_model: boolean;
+  documents: number;
+  processing: number;
+  failed: number;
+  entities: number;
+}
+
 export interface LlmSettingsView {
   chat_base_url?: string | null;
   chat_model?: string | null;
@@ -233,6 +262,12 @@ export interface LlmSettingsView {
   embed_model?: string | null;
   embed_dim?: number | null;
   has_embed_key?: boolean;
+  ocr_base_url?: string | null;
+  ocr_backend?: string | null;
+  has_ocr_key?: boolean;
+  transcribe_base_url?: string | null;
+  transcribe_model?: string | null;
+  has_transcribe_key?: boolean;
 }
 
 export interface Member {
@@ -248,6 +283,13 @@ export interface OrgUser {
   email: string;
   display_name: string;
   is_admin: boolean;
+}
+
+/** 一个身份提供方 subject 绑定到的账号（0056） */
+export interface OidcIdentity {
+  user_id: string;
+  subject: string;
+  email: string;
 }
 
 /** 问数数据源（凭据不下发,只有 host:port/db 摘要）。 */
@@ -304,22 +346,124 @@ export interface ChunkFact {
  *
  * `premises` 是这一档存在的理由：不给出前提的话，一条派生边跟一条普通的边
  * 在界面上看不出区别，而那正是「推理污染知识」的样子。 */
+/** 一条条件：这个属性、这样比、跟这个值比 */
+export interface RuleCondition {
+  /** 组号：同组「与」，组间「或」（决定记录 0029）。不带 = 第 0 组 */
+  group?: number;
+  predicate_id: string;
+  /** gt | gte | lt | lte | between | in | not_in | present */
+  op: string;
+  /** 数字 / [lo,hi] / 字符串数组；present 不带 */
+  operand?: unknown;
+  predicate_label?: string;
+}
+
+export interface RuleInput {
+  name: string;
+  description?: string;
+  subject_type_id: string;
+  /** typing = 推出一个类；attribute = 推出一个属性值 */
+  conclusion: "typing" | "attribute";
+  conclude_type_id?: string;
+  conclude_predicate_id?: string;
+  conclude_value?: unknown;
+  conditions: RuleCondition[];
+}
+
+/** 一条规则标住的一个实体，连同让它成立的那几条读数 */
+export interface RuleMatch {
+  derived_id: string;
+  entity_id: string;
+  entity: string;
+  concluded: string | null;
+  valid_from: string | null;
+  valid_to: string | null;
+  /** 「全烃 = 12.3」这种可读形态，按前提顺序 */
+  premises: string[];
+}
+
+export interface BusinessRule extends Omit<RuleInput, "conclusion"> {
+  conclusion: "typing" | "attribute" | "computed";
+  /** Raw server tree; unsupported nodes must remain read-only. */
+  conclude_expr?: unknown;
+  id: string;
+  enabled: boolean;
+  subject_label: string;
+  conclude_type_label: string | null;
+  conclude_predicate_label: string | null;
+  /** 此刻凭它成立的结论条数 */
+  derived_count: number;
+  /** 上次跑的时候有几个实体的读数组合没展开完。**大于零就意味着少推了** */
+  capped: number;
+}
+
 export interface DerivedFact {
   id: string;
   subject_id: string;
   subject: string;
-  object_id: string;
+  /** 字面值结论（规则推出的归类与属性）没有实体宾语 */
+  object_id: string | null;
   object: string;
   predicate: string;
   /** 靠哪条规则推的 */
   /** 靠哪条规则推的。后两种是 0017 补上的跨谓词规则 */
-  rule: "transitive" | "symmetric" | "inverse" | "sub_property";
+  rule: "transitive" | "symmetric" | "inverse" | "sub_property" | "business";
+  /** 业务规则的名字。公理推的为 null——公理没有名字 */
+  rule_name?: string | null;
   valid_from: string | null;
   valid_to: string | null;
   confidence: number;
   derived_at: string;
   /** 直接前提，按推导顺序 */
   premises: string[];
+}
+
+/** 一条**没有落地**的派生（0017 §3）：推出来了，撞上一条断言，拦在图外。
+ *  没有自己的 id，用那条违规的 id 指它——面板、幽灵边、Review 卡片三处靠它对上 */
+export interface BlockedDerivation {
+  violation_id: string;
+  subject_id: string;
+  subject: string;
+  object_id: string;
+  object: string;
+  predicate: string;
+  rule: string;
+  via_label: string;
+  valid_from: string | null;
+  valid_to: string | null;
+  against_fact: string;
+  against_text: string;
+  premises: string[];
+}
+
+/** 证明的一步：一条前提，连同它的证据（0002 R2）。
+ *
+ * 那一步自己的前提在 `premises` 里再往下一层。所以证明是一棵树，
+ * 深度与推理同一条上限。断言那一步 `premises` 是空的——它的叶子是
+ * `evidence` 里的原句，不必再往下问
+ */
+export interface ProofStep {
+  seq: number;
+  fact_id: string;
+  subject_id: string;
+  subject: string;
+  predicate_id: string | null;
+  predicate: string | null;
+  object_id: string | null;
+  object: string | null;
+  valid_from: string | null;
+  valid_to: string | null;
+  confidence: number;
+  /** 这条前提后来被撤了；派生随之失效，证明仍要读得出当时靠的是什么 */
+  retracted: boolean;
+  evidence: Evidence[];
+  /** 这一步自己的前提（0030）：按 seq 展开的子证明。叶子的 premises 为空 */
+  premises: ProofStep[];
+}
+
+export interface Proof {
+  derived: DerivedFact;
+  steps: ProofStep[];
 }
 
 /** 审核页的分档。**与服务端的 queue 参数是同一组字面量**——拼错会拿到
@@ -333,20 +477,44 @@ export type ReviewQueue =
   | "mappings"
   | "violations"
   | "defects"
-  | "merges";
+  // 对齐器两票不一致的签名与类别词（#725，0044 决定 3）
+  | "alignment"
+  // 勘误 agent 被闸门拦下、等人答的动作（0044 决定 7）
+  | "errata"
+  | "merges"
+  // agent 的每一笔（0025）：建议、自动裁决与人的回答
+  | "agent";
+
+/** 重复项按两边类型的关系筛：any 全部；same 两边都有类型且相等；conflict 都有且不等 */
+export type ReviewTypeFilter = "any" | "same" | "conflict";
 
 /** 各档的真实条数。左栏的徽标读它，不读列表长度 */
 export interface ReviewCounts {
   /** 记忆抽出、等人点头的事实（0015） */
   pending: number;
   duplicates: number;
+  /** 重复项里两边同类型 / 类型冲突的各多少（#428）；没类型的一侧哪档都不算 */
+  duplicates_same_type: number;
+  duplicates_type_conflict: number;
   conflicts: number;
   unconfirmed: number;
   lowconf: number;
   mappings: number;
   violations: number;
   defects: number;
+  /** 对齐器拿不定的签名与类别词（#725） */
+  alignment: number;
+  /** 勘误 agent 留给人的动作（0044 决定 7） */
+  errata: number;
   merges: number;
+  /** agent 写下、等人回答的建议（0025） */
+  agent: number;
+  /** agent 的全部记录（Agent 队列翻页用） */
+  agent_rows: number;
+  /** 这个库的 govern 任务此刻在跑 */
+  agent_running: boolean;
+  /** 还没轮到 agent 看的对 */
+  agent_queue: number;
 }
 
 /** 类型消解的一条建议：一个待精化的实体、送去检索的画像、以及候选类。
@@ -409,6 +577,14 @@ export interface ReviewSide {
   top_facts: string[];
 }
 
+/** agent 在一对上留下的、还开着的建议（0025）；卡片上的裁决就是对它的回答 */
+export interface ReviewProposal {
+  id: string;
+  action: "merge" | "keep" | "unsure";
+  confidence: number;
+  reason: string | null;
+}
+
 export interface ReviewItem {
   id: string;
   score: number;
@@ -417,7 +593,47 @@ export interface ReviewItem {
   created_at: string;
   left: ReviewSide;
   right: ReviewSide;
+  proposal: ReviewProposal | null;
 }
+
+/** agent 的一笔（0025）：看了哪一对、想怎么办、凭什么、人怎么答的 */
+export interface AgentDecision {
+  id: string;
+  run_id: string;
+  target_kind: "review";
+  target_id: string;
+  action: "merge" | "keep" | "unsure";
+  confidence: number;
+  reason: string | null;
+  /** 它被给看的先例：同对 / 同名 / 撤回各一条一条，类型对的习惯是一条汇总 */
+  precedents: AgentPrecedent[];
+  status: "proposed" | "applied" | "accepted" | "overridden" | "reverted" | "superseded";
+  merge_id: string | null;
+  /** defer 留给人的那一个问题；只有 unsure 的行才有 */
+  question: string | null;
+  /** 第二层看了什么：一条一次查询 */
+  trace: { tool: string; args: Record<string, string>; note: string }[];
+  /** 第二层花的模型调用 */
+  calls: number;
+  created_at: string;
+  decided_at: string | null;
+  decided_by_name: string | null;
+  left: string | null;
+  right: string | null;
+}
+
+export type AgentPrecedent =
+  | {
+      family: "same_pair" | "same_name" | "revert";
+      event_id: string;
+      action: string;
+      left: string;
+      right: string;
+      at: string;
+      /** 人拍板时写的那一句（0026）；0026 之前的决定没有 */
+      why?: string | null;
+    }
+  | { family: "type_pair"; merged: number; kept: number; reverted: number };
 
 /** 数据映射的一条口径：业务概念 → 数据资产定义（见 docs/decisions/0011）。
  *
@@ -448,9 +664,34 @@ export interface MappingRevision {
   changed_at: string;
 }
 /** 一处公理违规（0002 R0）。判据来自本体自己声明的公理，没声明就不报 */
+/** derived_contradiction 独有（0017）：推出来的那条三元组——它没有落库，
+ *  只能在这里写出来。其它种类是 `{}` */
+export interface ViolationDetail {
+  axiom?: "functional" | "inverse_functional" | "asymmetry" | "self_loop";
+  rule?: "transitive" | "symmetric" | "inverse" | "sub_property";
+  via_label?: string;
+  subject?: string;
+  predicate?: string;
+  object?: string;
+  valid_from?: string | null;
+  valid_to?: string | null;
+  premises?: string[];
+}
+export type ViolationResolution =
+  | "fact_retracted"
+  | "fact_closed"
+  | "axiom_relaxed"
+  | "accepted";
 export interface AxiomViolation {
   id: string;
-  kind: "self_loop" | "asymmetry" | "cycle" | "functional";
+  kind:
+    | "self_loop"
+    | "asymmetry"
+    | "cycle"
+    | "functional"
+    | "inverse_functional"
+    | "signature"
+    | "derived_contradiction";
   /** 判据来自哪条关系。判「公理写错了」时从这里进本体去改 */
   predicate: string | null;
   left_fact: string;
@@ -458,12 +699,88 @@ export interface AxiomViolation {
   /** 自反那一类与 left 相同——一条事实跟自己矛盾 */
   right_fact: string;
   right_text: string;
-  /** 环的长度；其余三类为 0 */
+  /** `path` 的长度：环上的、互斥组里的事实，派生的前提；自环与签名为 0 */
   path_len: number;
   detected_at: string;
+  detail: ViolationDetail;
+  /** 审核线索（0017 §2），一次只给一条：旧断言没写结束日期、有同名实体、
+   *  抽取置信度低。没有就空 */
+  hint: "stale" | "duplicate" | "unsure" | null;
+  /** 环上的每一条事实（按顺序），或互斥组里的每一条（按 id）；自环与签名为空。
+   *  撤事实要指名撤哪条（#202） */
+  path: { id: string; text: string }[];
 }
 /** 本体自己的一处自相矛盾。**与 AxiomViolation 不是一回事**：那个说
  *  「事实与定义抵触」，这个说「定义自己站不住」，后者更根本 */
+/** 对齐队列里的一条（#725）：一条短语签名，或一个类别词，都是对齐器两票不一致、等人定的 */
+export type AlignmentItem =
+  | {
+      kind: "phrase";
+      id: string;
+      phrase: string;
+      subject_class: string | null;
+      object_class: string | null;
+      object_is_value: boolean;
+      statement_count: number;
+      examples: string[];
+      /** 两票；候选多到没问模型时两票为空、`reason` 说明（0053） */
+      votes: {
+        first?: AlignmentVote | null;
+        second?: AlignmentVote | null;
+        reason?: string;
+        candidates?: number;
+      } | null;
+      decided_at: string;
+    }
+  | {
+      kind: "kind_word";
+      kind_word: string;
+      words: string[];
+      examples: string[];
+      phrases: string[];
+      entity_count: number;
+      votes: { first?: string | null; second?: string | null } | null;
+      decided_at: string;
+    }
+  | {
+      /** 对齐器提的一条蕴含规则（0044 决定 3 第五片） */
+      kind: "rule";
+      id: string;
+      trigger: "phrase" | "kind_word";
+      phrase: string;
+      subject_class: string | null;
+      object_class: string | null;
+      object_is_value: boolean;
+      property: string;
+      property_label: string;
+      reading: string | null;
+      statement_count: number;
+      examples: string[];
+      votes: { agent?: { property: string; reading: string | null } | null } | null;
+      decided_at: string;
+    };
+/** 勘误 agent 被闸门拦下的一笔（0044 决定 7）：它想撤、改或加什么，凭哪句原话，为什么留给人 */
+export interface ErrataItem {
+  id: string;
+  document_id: string;
+  document: string;
+  action: "retract" | "revise" | "add";
+  /** 结构报的理由；空 = 抽样看到的 */
+  flag: "domain" | "range" | "name_absent" | "no_date" | null;
+  fact_id: string | null;
+  /** 动作指向的那条事实：撤的就是看的那条，改的是改成的，加的是加的 */
+  proposed: { subject: string; property: string; object: string } | null;
+  reason: string;
+  quote: string | null;
+  /** 闸门的理由：`derived 2` / `answered 1` / `contradiction CEO of`（0027 的写法） */
+  detail: string | null;
+  created_at: string;
+}
+export interface AlignmentVote {
+  property: string;
+  direction: "forward" | "reverse";
+}
+
 export interface OntologyDefect {
   id: string;
   kind:
@@ -475,11 +792,27 @@ export interface OntologyDefect {
     // 0017 加的三类：都在谓词上，前两类关于逆，第三类是子属性成环
     | "inverse_of_itself"
     | "inverse_not_mutual"
-    | "sub_property_cycle";
+    | "sub_property_cycle"
+    // 0017：两条规则加在一起产出互斥的派生，按规则对聚合报一次
+    | "rules_disagree";
   subject_label: string | null;
   other_label: string | null;
   path_labels: string[];
   detected_at: string;
+  detail: DefectDetail;
+}
+/** rules_disagree 独有：哪两条规则、撞在哪条公理上、几对、几个例子 */
+export interface DefectDetail {
+  count?: number;
+  rules?: {
+    rule_a: string;
+    via_a: string;
+    rule_b: string;
+    via_b: string;
+    axiom: string;
+    count: number;
+    examples: [string, string][];
+  }[];
 }
 export interface FactReviewItem {
   id: string;
@@ -503,6 +836,12 @@ export interface PendingFactItem {
   /** 本体里的关系名；为空时显示 `proposed_predicate`（斜体，标明是原话） */
   predicate_label: string | null;
   proposed_predicate: string | null;
+  /** 开放陈述（0044）：文档自己的关系短语；有它就没有 predicate，那不是缺陷 */
+  phrase: string | null;
+  /** 按文档角色词记的限定：值或实体 */
+  qualifiers: { role: string; value?: unknown; entity_id?: string; entity_name?: string }[] | null;
+  /** 照抄的时间词，不是算出来的日期 */
+  time_words: { text: string; char_start: number }[] | null;
   object_id: string | null;
   object_name: string | null;
   object_value: { value?: unknown; unit?: string; summary?: string } | null;
@@ -513,6 +852,8 @@ export interface PendingFactItem {
   quote: string;
   proposed_by: string | null;
   proposed_by_name: string | null;
+  /** 经 MCP 记进来时，那个 agent 的令牌名；网页端对话里为空 */
+  proposed_token_name: string | null;
   created_at: string;
 }
 
@@ -545,6 +886,61 @@ export interface ReviewHistoryEvent {
   created_at: string;
 }
 
+/** 一档队列里等着的：多少条、最老的一条从什么时候起等（空队列是 null） */
+export interface QueueWait {
+  count: number;
+  oldest_at: string | null;
+}
+
+/** 一个时间窗口里的决定 */
+export interface DecidedWindow {
+  total: number;
+  /** 其中台账上没有 actor 的——AI 裁决器自己办的 */
+  automatic: number;
+  by_action: { action: string; count: number }[];
+  /** actor_id 为 null 的一行是裁决器；label 是台账里的身份快照 */
+  by_actor: { actor_id: string | null; label: string | null; count: number }[];
+}
+
+/** 一个时间窗口里 agent 写下的行，按现在的状态数 */
+export interface AgentWindow {
+  applied: number;
+  proposed: number;
+  accepted: number;
+  overridden: number;
+  reverted: number;
+}
+
+/** 审核台总览（#377）：等着办的、办过的、库的成色。与左栏计数同一套口径 */
+export interface ReviewSummary {
+  /** agent 在这个库里做过什么（0025） */
+  agent: { running: boolean; queue: number; open: number; last_7d: AgentWindow; last_30d: AgentWindow };
+  waiting: Record<
+    | "pending"
+    | "duplicates"
+    | "conflicts"
+    | "unconfirmed"
+    | "lowconf"
+    | "violations"
+    | "defects"
+    | "alignment"
+    | "errata",
+    QueueWait
+  >;
+  decided: {
+    last_7d: DecidedWindow;
+    last_30d: DecidedWindow;
+    /** 近 14 天，一天一条，含零 */
+    daily: { day: string; count: number }[];
+  };
+  health: {
+    facts: number;
+    low_confidence: number;
+    unconfirmed: number;
+    contested: number;
+  };
+}
+
 export interface MergeLog {
   id: string;
   source_name: string;
@@ -555,6 +951,16 @@ export interface MergeLog {
   reverted_at: string | null;
 }
 
+/** 边上的属性（0037）：`{ key: "amount", value: { value: 4e9, unit: "$" } }` */
+export interface FactQualifier {
+  qualifier_type_id: string;
+  key: string;
+  label: string;
+  value: { value?: unknown; unit?: string } | null;
+  entity_id: string | null;
+  entity_name: string | null;
+}
+
 export interface GraphEdge {
   id: string;
   source: string;
@@ -562,6 +968,9 @@ export interface GraphEdge {
   /** 本体没认下这条关系时是原文说法；两者都拿不出时为 null（0052 之前的老数据） */
   predicate: string | null;
   label: string | null;
+  /** 这条边是从哪条开放陈述算出来的，那条陈述的原话（0044 决定 1）：
+   *  画布一条陈述只画一条边，有类型化行就画它，原话跟在这里不丢 */
+  said_as: string | null;
   /** true = 这条边的名字来自原文，不是本体认下的关系 */
   inferred: boolean;
   /** true = 这条边是**推出来的**，不是任何人断言的（R1）。
@@ -576,7 +985,33 @@ export interface GraphEdge {
   premises: string[];
   valid_from: string | null;
   valid_to: string | null;
+  /** **读出来的**区间（0022）：没起点的事实从最早的证据起，结束了不知哪天的到说出
+   *  它的那份文档为止。滑杆按这两个过滤；上面那两个是原文说了什么，只用来显示。
+   *  前端不自己解释 NULL——规则只在服务端的 world_axis 里有一份 */
+  holds_from: string | null;
+  holds_to: string | null;
   confidence: number;
+  /** 有争议（0017 §3）：有一条 open 的公理违规或时态冲突指着它。整条边画成警戒色 */
+  contested: boolean;
+  /** 幽灵边（0017 §3）：没落地的派生。`id` 是那条 `derived_contradiction` 违规的 id；
+   *  `derived` 同时为 true，跟着派生开关走。点它打开主语的面板 */
+  blocked: boolean;
+  /** 边上的属性（0037） */
+  qualifiers: FactQualifier[];
+}
+
+/** 实体的一个名字（0041）。`canonical` 是面板标题上那个；曾用名在世界轴上有结束 */
+export interface NameView {
+  fact_id: string;
+  name: string;
+  canonical: boolean;
+  recorded_at: string;
+  valid_from: string | null;
+  valid_from_precision: string | null;
+  valid_to: string | null;
+  valid_to_precision: string | null;
+  document_ids: string[];
+  evidence_count: number;
 }
 
 export interface EntityFact {
@@ -585,6 +1020,9 @@ export interface EntityFact {
   /** 同 GraphEdge：本体外的关系回落到原文说法，两者都没有时为 null */
   predicate_key: string | null;
   predicate_label: string | null;
+  /** 这条边是从哪条开放陈述算出来的，那条陈述的原话（0044 决定 1）：
+   *  画布一条陈述只画一条边，有类型化行就画它，原话跟在这里不丢 */
+  said_as: string | null;
   /** true = 名字来自原文，不是本体认下的关系 */
   inferred: boolean;
   /** 关系的时态类别。没有谓词就无从谈起，为 null */
@@ -593,8 +1031,13 @@ export interface EntityFact {
   other_name: string | null;
   /** 字面值宾语（属性事实/问数映射）：{"value":…} 或 {"summary":…} */
   object_value: Record<string, unknown> | null;
+  /** 边上的属性（0037） */
+  qualifiers: FactQualifier[];
   valid_from: string | null;
   valid_to: string | null;
+  /** 读出来的区间（0022），与 GraphEdge 同义：「此刻成立」按它判 */
+  holds_from: string | null;
+  holds_to: string | null;
   valid_from_precision: string | null;
   /** year | month | day，外加 unknown = 原文说它结束了但没说哪天 */
   valid_to_precision: string | null;
@@ -604,6 +1047,13 @@ export interface EntityFact {
   stale: boolean;
   /** 修正行：区间闭合来自引擎对账/人工裁决而非抽取原文 */
   corrected: boolean;
+  /** 有争议（0017 §3）：哪一种、Review 里那一项的 id、派生撞断言时推出来的那句话。
+   *  行不压暗——断言仍然活着 */
+  contested: {
+    kind: string;
+    ref_id: string;
+    derived?: string | null;
+  } | null;
   /** 证据集合里最新的文档时间（开放事实的"最后确认时间"） */
   last_evidence_time: string | null;
 }
@@ -622,6 +1072,11 @@ export interface EntityHistoryEvent {
     | "corrected"
     | "rejected"
     | "merged"
+    /** 别人并进了它：事实搬到它名下 */
+    | "merged_in"
+    /** 它并进了别人：这个 id 从此不再单独存在 */
+    | "merged_away"
+    | "merge_reverted"
     | "retyped"
     | "retype_reverted";
   direction: "out" | "in" | null;
@@ -657,12 +1112,23 @@ export interface Evidence {
   doc_version: number;
   /** 文档已有更新版本（证据停留在旧版；不代表事实失效） */
   stale: boolean;
+  /** 这条证据的文档已被删除；事实还活着是因为另有出处（#268） */
+  document_deleted: boolean;
+  /** 这块文字从哪来（0040）；证明链那条路不带，缺席即原文 */
+  origin?: "stated" | "ocr" | "transcribed" | "described";
+  origin_model?: string | null;
+  anchor?: Record<string, unknown> | null;
 }
 
 export interface ChunkFull {
   id: string;
   seq: number;
   text: string;
+  /** 这块文字从哪来（0040） */
+  origin: "stated" | "ocr" | "transcribed" | "described";
+  origin_model: string | null;
+  /** ocr: {page, bbox?}；transcribed: {start_ms, end_ms, speaker} */
+  anchor: Record<string, unknown> | null;
 }
 
 export interface EntityTypeView {
@@ -706,6 +1172,8 @@ export interface RelationTypeView {
   domains: string[];
   /** 可以当宾语的类。只对 relation 有意义——attribute 的值域是 datatype */
   ranges: string[];
+  /** 这条关系的边能带哪些属性（0037）：属性定义的 id */
+  qualifiers: string[];
   datatype: "text" | "number" | "date" | "bool" | null;
   unit: string | null;
   usage: number;
@@ -716,6 +1184,37 @@ export interface OntologyMiss {
   key: string;
   example: string | null;
   count: number;
+}
+
+/** 一条谓词的一端挂着两个以上开放值（#341）。
+ *
+ *  本体自己长出来的库里没人声明过唯一性，于是接任不闭合前任：两条 `leads`
+ *  都开着，"六月谁在管"两个都答。引擎不自动推断这个公理（它驱动账本改写），
+ *  所以只能把证据摆出来问人。 */
+export interface UniquenessCandidate {
+  predicate_id: string;
+  key: string;
+  label: string;
+  kind: string;
+  /** subject = 主语侧（functional）；object = 宾语侧（inverse functional） */
+  side: "subject" | "object";
+  axiom: "functional" | "inverse_functional";
+  /** 已经声明过、只是还没对过账（导入的，或声明之前就在的行） */
+  declared: boolean;
+  holders: number;
+  open_facts: number;
+  /** 对账会闭合几条，几条拿不准要进人审 */
+  would_close: number;
+  would_review: number;
+  examples: {
+    holder: string;
+    values: {
+      fact_id: string;
+      name: string | null;
+      valid_from: string | null;
+      confidence: number;
+    }[];
+  }[];
 }
 
 /** `description` 与 `reason` 不是一回事：description 逐字进抽取提示词，是模型判断
@@ -783,7 +1282,7 @@ export interface PlannedItem {
   key: string;
   label: string;
   has_description: boolean;
-  disposition: "create" | "update" | "key_taken";
+  disposition: "create" | "update" | "key_taken" | "aligned" | "superseded";
   functional?: boolean;
   conflict_with?: string | null;
 }
@@ -801,12 +1300,37 @@ export interface ImportPlan {
   functional_relations: number;
 }
 
+/** 一次导入记下的账。**键与 `owl_import.rs` 写进 `summary` 的一一对应**；
+ *  全是可选的——老记录可能缺字段，界面按缺失处理而不是显示 0 */
+export interface OntologyImportSummary {
+  classes_created?: number;
+  classes_updated?: number;
+  classes_key_taken?: number;
+  classes_without_description?: number;
+  relations_seen?: number;
+  relations_created?: number;
+  relations_superseded?: number;
+  relations_updated?: number;
+  functional_relations?: number;
+  /** 逆属性 / 父属性连上了几条——目标 IRI 不在这个库里时会静默跳过 */
+  inverse_linked?: number;
+  sub_property_linked?: number;
+  attributes_seen?: number;
+  attributes_created?: number;
+  /** **按原因分组的计数**，不是一个数：`{no_domain: 3, unknown_domain: 1}`。
+   *  跳过一个属性的理由不止一种，而理由才是人下一步要处理的东西 */
+  attributes_skipped?: Record<string, number>;
+  /** 没投影下来的 IRI 与出现次数（服务端最多记 30 条） */
+  unprojected?: [string, number][];
+  triples?: number;
+}
+
 export interface OntologyImportView {
   id: string;
   filename: string;
   format: string;
   byte_size: number;
-  summary: Record<string, unknown>;
+  summary: OntologyImportSummary;
   imported_by_name: string | null;
   imported_at: string;
 }
@@ -826,7 +1350,17 @@ export interface Source {
 
 /** Agentic 对话的行动轨迹（工具调用一步一条）。 */
 export interface ChatStep {
-  kind: "search" | "docs" | "entity" | "facts" | "changes" | "query" | "tool";
+  kind:
+    | "search"
+    | "docs"
+    | "entity"
+    | "facts"
+    | "neighbors"
+    | "timeline"
+    | "path"
+    | "changes"
+    | "query"
+    | "tool";
   label: string;
   detail: string;
   /** `remember` 那一步带着它：那句记忆落成的 chunk。对话里的确认卡按它取
@@ -895,6 +1429,17 @@ export const api = {
     );
   },
   alertsUnread: () => request<{ unread: number }>("/api/v1/alerts/unread"),
+  /** 失败任务回队列（#216）。库内一条、全局一条（管理员）；范围可按种类与失败时间收窄 */
+  failedJobs: (kbId: string) =>
+    request<{ failed: number }>(`/api/v1/kbs/${kbId}/jobs/failed`),
+  requeueJobs: (
+    kbId: string | null,
+    body: { kind?: string; failed_since?: string } = {},
+  ) =>
+    request<{ requeued: number }>(
+      kbId ? `/api/v1/kbs/${kbId}/jobs/requeue` : "/api/v1/jobs/requeue",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   alertReadGroup: (g: {
     kb_id: string | null;
     kind: string;
@@ -950,6 +1495,12 @@ export const api = {
   revokeToken: (tokenId: string) =>
     request<{ ok: boolean }>(`/api/v1/me/tokens/${tokenId}`, { method: "DELETE" }),
   workspaces: () => request<Workspace[]>("/api/v1/workspaces"),
+  /** 这个工作区，以及**我在里面是什么角色**。建库要 Admin+（见 api/kbs.rs
+   *  的 create），而 `GET /workspaces` 那份列表不带角色 */
+  workspaceRole: (workspaceId: string) =>
+    request<{ workspace: Workspace; role: string }>(
+      `/api/v1/workspaces/${workspaceId}`,
+    ),
 
   kbs: (workspaceId: string) =>
     request<Kb[]>(`/api/v1/workspaces/${workspaceId}/kbs`),
@@ -1098,6 +1649,13 @@ export const api = {
     request<{ ok: boolean }>(`/api/v1/admin/data-sources/${id}`, {
       method: "DELETE",
     }),
+  /** 存之前先试一次：**不落库**。回来的是 ok，连不上时还有一句原因——
+   *  密码错、库名拼错、端口不通是三件不同的事 */
+  adminTestConnString: (conn_string: string) =>
+    request<{ ok: boolean; engine?: string; error?: string }>(
+      "/api/v1/admin/data-sources/test",
+      { method: "POST", body: JSON.stringify({ conn_string }) },
+    ),
   adminTestDataSource: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/admin/data-sources/${id}/test`, {
       method: "POST",
@@ -1141,6 +1699,23 @@ export const api = {
       items: ConceptMapping[];
       total: number;
       counts: { proposed: number; confirmed: number; rejected: number };
+      // 最近一轮探索的账（#503）。单看列表答不了「漏了多少」——
+      // 十二条提议对着八十列的宽表与刚好覆盖完一个小库长得一样。
+      last_run?: {
+        id: string;
+        started_at: string;
+        finished_at: string | null;
+        sources: string[];
+        tables_scanned: number;
+        columns_scanned: number;
+        schema_truncated: boolean;
+        cap: number;
+        returned: number;
+        accepted: number;
+        dropped: Record<string, { n: number; example: string }>;
+        tables_covered: string[];
+        error: string | null;
+      };
     }>(`/api/v1/kbs/${kbId}/mappings${qs ? `?${qs}` : ""}`);
   },
   /** 改一条口径。改之前那一版自动进 revisions */
@@ -1204,6 +1779,8 @@ export const api = {
       source?: string;
       q?: string;
       graph?: string;
+      /** "deleted" = 「已删除」视图：只列墓碑（#268） */
+      state?: "deleted";
       limit: number;
       offset: number;
     },
@@ -1215,14 +1792,19 @@ export const api = {
     if (opts.source) p.set("source", opts.source);
     if (opts.q) p.set("q", opts.q);
     if (opts.graph) p.set("graph", opts.graph);
+    if (opts.state) p.set("state", opts.state);
     return request<{
       docs: Doc[];
       total: number;
-      /** 下面三个**只按来源作用域算**，不受名字/状态筛选影响——
+      /** 下面四个**只按来源作用域算**，不受名字/状态筛选影响——
        *  它们是批量按钮的作用范围 */
       ready: number;
+      /** `graph_status = 'done'`：抽取进度条的分子 */
+      done: number;
       extracting: number;
       failed: number;
+      /** 整库的墓碑数（删了、没清的），不随作用域变 */
+      deleted: number;
     }>(`/api/v1/kbs/${kbId}/documents?${p}`);
   },
   /** 一键重试这个作用域里全部抽取失败的文档 */
@@ -1246,7 +1828,19 @@ export const api = {
     );
   },
   deleteDocument: (id: string) =>
-    request<{ ok: boolean }>(`/api/v1/documents/${id}`, { method: "DELETE" }),
+    request<{ ok: boolean; deletion_id: string; invalidated_facts: number }>(
+      `/api/v1/documents/${id}`,
+      { method: "DELETE" },
+    ),
+  /** 撤销删除（#268）：文档、分块、随之作废的事实原路复活 */
+  restoreDocument: (id: string) =>
+    request<{ ok: boolean }>(`/api/v1/documents/${id}/restore`, { method: "POST" }),
+  /** 真删（#268 下半）：只对已删除的开放，库管理员，不可撤销 */
+  purgeDocument: (id: string) =>
+    request<{ ok: boolean; chunks: number; blobs: number }>(
+      `/api/v1/documents/${id}/purge`,
+      { method: "POST" },
+    ),
 
   search: (kbId: string, q: string) =>
     request<{ results: SearchResult[] }>(`/api/v1/kbs/${kbId}/search`, {
@@ -1289,9 +1883,14 @@ export const api = {
     request<{
       entity: GraphNode;
       facts: EntityFact[];
+      /** 这个实体的名字（0041）：本名、简称、曾用名，各带出处与有效期。
+       *  名字事实不在 facts 里——它不是一条「关于它的事」 */
+      names: NameView[];
       /** 推出来的那些**单独一个键**，不掺进 facts：混在同一个列表里，
        *  用户看不出「文档里写的」和「引擎推的」的区别 */
       derived: DerivedFact[];
+      /** 没落地的派生（0017 §3）：连 `derived_facts` 都不在，所以也单独一个键 */
+      blocked: BlockedDerivation[];
       /** 同名的其他实体。**打开面板就给**——合并入口要长在能看见同名的地方，
        *  而不是藏在「改一次名」之后 */
       same_name: GraphNode[];
@@ -1308,6 +1907,84 @@ export const api = {
       { method: "PATCH", body: JSON.stringify(body) },
     ),
 
+  /** 人工修正一条事实的有效区间（302）。**整体替换**：四个值一起提交，
+   *  服务端作废旧行、插修正行——不是原地改，所以这次修改会出现在 History 上。 */
+  updateFactTime: (
+    kbId: string,
+    factId: string,
+    body: {
+      valid_from: string | null;
+      valid_from_precision: string | null;
+      valid_to: string | null;
+      valid_to_precision: string | null;
+      note?: string;
+    },
+  ) =>
+    request<{
+      ok: boolean;
+      unchanged?: boolean;
+      fact_id?: string;
+      closed?: number;
+      conflicts?: number;
+    }>(`/api/v1/kbs/${kbId}/facts/${factId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+
+  /** 这个库走到哪一步了（#313）：四个页面的空状态共用。只回布尔与计数 */
+  readiness: (kbId: string) =>
+    request<Readiness>(`/api/v1/kbs/${kbId}/readiness`),
+
+  /* ---- 业务规则（0021 / #277）：人写下的判据，引擎按物化的节奏跑 ---- */
+  rules: (kbId: string) =>
+    request<{ rules: BusinessRule[] }>(`/api/v1/kbs/${kbId}/rules`),
+  createRule: (kbId: string, body: RuleInput) =>
+    request<{ id: string }>(`/api/v1/kbs/${kbId}/rules`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateRule: (
+    kbId: string,
+    ruleId: string,
+    body: {
+      name?: string;
+      description?: string;
+      enabled?: boolean;
+      conditions?: RuleCondition[];
+      /** 结论整组替换：三格互相定义，只改一格会留下半截状态 */
+      conclusion?: "typing" | "attribute";
+      conclude_type_id?: string;
+      conclude_predicate_id?: string;
+      conclude_value?: unknown;
+    },
+  ) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/rules/${ruleId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  /** 一条规则此刻标了谁。规则卡片上那个数字点开就是它 */
+  ruleMatches: (kbId: string, ruleId: string, page = 0, per = 20) =>
+    request<{ matches: RuleMatch[]; total: number }>(
+      `/api/v1/kbs/${kbId}/rules/${ruleId}/matches?page=${page}&per=${per}`,
+    ),
+  deleteRule: (kbId: string, ruleId: string) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/rules/${ruleId}`, {
+      method: "DELETE",
+    }),
+  /** 立刻跑一遍。物化默认一小时一轮，而写规则的人想马上看见它推出了什么 */
+  runRules: (kbId: string) =>
+    request<{
+      rules: number;
+      hits: number;
+      capped: number;
+      inserted: number;
+      invalidated: number;
+      /** 链跑了几轮：1 就是没有链，2 就是一条规则读了另一条的结论（0030） */
+      rounds: number;
+      /** 跑满上限还在产出：链比 MAX_DEPTH 长，后面那几环没接上 */
+      rounds_capped: boolean;
+    }>(`/api/v1/kbs/${kbId}/rules/run`, { method: "POST" }),
+
   entityHistory: (kbId: string, entityId: string, page: number, per = 30) =>
     request<{ events: EntityHistoryEvent[]; total: number }>(
       `/api/v1/kbs/${kbId}/entities/${entityId}/history?page=${page}&per=${per}`,
@@ -1315,6 +1992,17 @@ export const api = {
   factEvidence: (kbId: string, factId: string) =>
     request<{ evidence: Evidence[] }>(
       `/api/v1/kbs/${kbId}/facts/${factId}/evidence`,
+    ),
+  /** 一条派生事实的证明（0002 R2）：前提按推导顺序，每条带证据，一路到原句。
+   *  派生已失效时回 null——不是错误 */
+  derivedProof: (kbId: string, derivedId: string) =>
+    request<{ proof: Proof | null }>(
+      `/api/v1/kbs/${kbId}/derived/${derivedId}/proof`,
+    ),
+  /** 没落地的派生的证明链（0017 §3）：前提在违规的 path 里 */
+  blockedProof: (kbId: string, violationId: string) =>
+    request<{ steps: ProofStep[] | null }>(
+      `/api/v1/kbs/${kbId}/violations/${violationId}/proof`,
     ),
   documentDetail: (id: string) =>
     request<{ document: Doc; chunks: ChunkFull[] }>(`/api/v1/documents/${id}`),
@@ -1382,6 +2070,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  /** 一端挂着两个以上开放值的谓词（#341）：本体没人声明唯一性时接任不闭合前任 */
+  uniquenessCandidates: (kbId: string) =>
+    request<{ candidates: UniquenessCandidate[] }>(
+      `/api/v1/kbs/${kbId}/ontology/uniqueness`,
+    ),
+
+  /** 补上声明之后把已经在账上的开放行对一遍。声明本身走 updateRelationType */
+  reconcileRelationType: (kbId: string, id: string) =>
+    request<{ corrected: number; conflicts: number }>(
+      `/api/v1/kbs/${kbId}/ontology/relation-types/${id}/reconcile`,
+      { method: "POST" },
+    ),
+
   updateRelationType: (
     kbId: string,
     id: string,
@@ -1562,24 +2263,47 @@ export const api = {
 
   /** 审核队列的各档**真实条数**。与列表分开取——列表有一页的上限，数数没有。
    *  从前徽标读的是数组长度，而接口固定只回 100 条，于是 164 条写成 100。 */
-  review: (kbId: string, queue: ReviewQueue, limit: number, offset: number) =>
+  review: (
+    kbId: string,
+    queue: ReviewQueue,
+    limit: number,
+    offset: number,
+    /** 只对 duplicates 有意义：按两边类型的关系筛（#428） */
+    types: ReviewTypeFilter = "any",
+  ) =>
     request<{
       counts: ReviewCounts;
       queue: ReviewQueue;
       /** 只有当前这一档的一页。类型按档不同，调用处按 queue 收窄 */
       items: unknown[];
     }>(
-      `/api/v1/kbs/${kbId}/review?queue=${queue}&limit=${limit}&offset=${offset}`,
+      `/api/v1/kbs/${kbId}/review?queue=${queue}&limit=${limit}&offset=${offset}&types=${types}`,
     ),
-  closeFact: (kbId: string, factId: string, validTo: string) =>
+  /** 一批重复项同一个动作（#428）：每条各自裁、各自记台账，回来逐条说成没成 */
+  /** `rationale`：人拍板时写的那一句（0026）——什么让你这么定。可不写；写了就跟着
+   *  决定一起进台账，下一次裁决器和 agent 读到的先例就不只是结果 */
+  reviewBatch: (kbId: string, ids: string[], action: "merge" | "keep", rationale?: string) =>
+    request<{
+      decided: number;
+      outcomes: { id: string; error: string | null }[];
+    }>(`/api/v1/kbs/${kbId}/review/batch`, {
+      method: "POST",
+      body: JSON.stringify({ ids, action, rationale: rationale || null }),
+    }),
+  /** 闭合日期带精度（year | month | day）：写多少位就是多少精度，服务端照存 */
+  closeFact: (kbId: string, factId: string, validTo: string, precision: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/facts/${factId}/close`, {
       method: "POST",
-      body: JSON.stringify({ valid_to: validTo }),
+      body: JSON.stringify({ valid_to: validTo, valid_to_precision: precision }),
     }),
   resolveConflict: (
     kbId: string,
     conflictId: string,
-    body: { action: "close" | "keep" | "reject_new"; close_at?: string },
+    body: {
+      action: "close" | "keep" | "reject_new";
+      close_at?: string;
+      close_at_precision?: string;
+    },
   ) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/conflicts/${conflictId}`, {
       method: "POST",
@@ -1595,10 +2319,10 @@ export const api = {
       `/api/v1/kbs/${kbId}/review/pending/${pendingId}`,
       { method: "POST", body: JSON.stringify({ action }) },
     ),
-  decideReview: (kbId: string, reviewId: string, action: "merge" | "keep") =>
+  decideReview: (kbId: string, reviewId: string, action: "merge" | "keep", rationale?: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/${reviewId}`, {
       method: "POST",
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, rationale: rationale || null }),
     }),
   /** 对一条数据映射口径表态（0011）。改状态不删行——拒绝留痕，下一轮探索不再提议它 */
   decideMapping: (
@@ -1622,11 +2346,44 @@ export const api = {
       found: number;
       inserted: number;
       cleared: number;
+      /** 环没搜完的谓词数（#642）。不为零时那些谓词上的环只报了一部分 */
+      cycles_capped: number;
       classes: number;
       /** 本体自己的矛盾**单独回**，不加进 found：两个数不是一类东西 */
       defects_found: number;
       defects_new: number;
     }>(`/api/v1/kbs/${kbId}/consistency/check`, { method: "POST" }),
+  /** 人定一条短语签名：属性与方向，或没有（陈述留在开放图谱）。判定和它的重算任务
+   *  一次提交，答 202 和 job id（0051）；类型化图谱在后台重算，`review` / `graph`
+   *  事件到了就是算完了，也可以拿 job id 去 `/kbs/{id}/jobs/{job_id}` 问 */
+  decideAlignmentPhrase: (
+    kbId: string,
+    bindingId: string,
+    property: string | null,
+    direction: "forward" | "reverse",
+  ) =>
+    request<{ ok: boolean; job_id: number; status: "accepted" }>(
+      `/api/v1/kbs/${kbId}/review/alignment/phrases/${bindingId}`,
+      { method: "POST", body: JSON.stringify({ property, direction }) },
+    ),
+  /** 人批或驳一条蕴含规则：答 202 和 job id，隐含事实在后台算（0044 决定 3 第五片） */
+  decideAlignmentRule: (kbId: string, ruleId: string, approve: boolean) =>
+    request<{ ok: boolean; job_id: number; status: "accepted" }>(
+      `/api/v1/kbs/${kbId}/review/alignment/rules/${ruleId}`,
+      { method: "POST", body: JSON.stringify({ approve }) },
+    ),
+  /** 人答勘误 agent 留下的一笔（0044 决定 7）：批了就执行，否了只记 */
+  decideErrata: (kbId: string, actionId: string, approve: boolean) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/errata/${actionId}`, {
+      method: "POST",
+      body: JSON.stringify({ approve }),
+    }),
+  /** 人定一个类别词：类，或没有。它名下的实体换类，短语签名跟着重判 */
+  decideAlignmentKindWord: (kbId: string, kindWord: string, cls: string | null) =>
+    request<{ ok: boolean }>(
+      `/api/v1/kbs/${kbId}/review/alignment/kind-words/${encodeURIComponent(kindWord)}`,
+      { method: "POST", body: JSON.stringify({ class: cls }) },
+    ),
   /** 对一处本体缺陷表态。**两个出路**——它压根没看数据，没有「数据错了」这条 */
   decideDefect: (
     kbId: string,
@@ -1642,10 +2399,10 @@ export const api = {
    *  第一个要看的就是「我们拿什么去找的」 */
   /** 手动合并：把 source 并进 target。**方向要紧**——source 消失，
    *  它的事实搬到 target 上；合并可整体回滚（entity_merges 记着快照） */
-  mergeEntities: (kbId: string, source: string, target: string) =>
+  mergeEntities: (kbId: string, source: string, target: string, rationale?: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/entities/merge`, {
       method: "POST",
-      body: JSON.stringify({ source, target }),
+      body: JSON.stringify({ source, target, rationale: rationale || null }),
     }),
   typeResolutionPreview: (kbId: string) =>
     request<{ items: TypeSuggestion[] }>(
@@ -1689,11 +2446,20 @@ export const api = {
   decideViolation: (
     kbId: string,
     violationId: string,
-    resolution: "fact_retracted" | "axiom_relaxed" | "accepted",
+    resolution: ViolationResolution,
+    opts: { closeAt?: string; closeAtPrecision?: string; factId?: string } = {},
   ) =>
     request<{ ok: boolean }>(
       `/api/v1/kbs/${kbId}/review/violations/${violationId}`,
-      { method: "POST", body: JSON.stringify({ resolution }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          resolution,
+          close_at: opts.closeAt ?? null,
+          close_at_precision: opts.closeAtPrecision ?? null,
+          fact_id: opts.factId ?? null,
+        }),
+      },
     ),
   confirmFact: (kbId: string, factId: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/facts/${factId}/confirm`, {
@@ -1706,6 +2472,20 @@ export const api = {
   revertMerge: (kbId: string, mergeId: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/merges/${mergeId}/revert`, {
       method: "POST",
+    }),
+  reviewSummary: (kbId: string) =>
+    request<ReviewSummary>(`/api/v1/kbs/${kbId}/review/summary`),
+  /** 回答 agent 的一笔（0025）：merge / keep 答一条建议，revert 撤回一条自动合并，
+   *  merge 也能推翻一条自动分开。走的是人的裁决路径，成为新先例 */
+  agentAnswer: (
+    kbId: string,
+    decisionId: string,
+    action: "merge" | "keep" | "revert",
+    rationale?: string,
+  ) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/agent/${decisionId}`, {
+      method: "POST",
+      body: JSON.stringify({ action, rationale: rationale || null }),
     }),
   reviewHistory: (kbId: string, page: number, per = 20) =>
     request<{ events: ReviewHistoryEvent[]; total: number }>(
@@ -1735,7 +2515,51 @@ export const api = {
     request<{
       chat: { ok: boolean; reply?: string; error?: string };
       embed: { ok: boolean; dim?: number; error?: string };
+      ocr?: { ok: boolean; version?: string | null; error?: string };
+      transcribe?: { ok: boolean; error?: string };
     }>(`/api/v1/workspaces/${workspaceId}/settings/test`, { method: "POST" }),
+  /** 读扫描件的服务、转写模型各自一个保存：存它们不碰对话与嵌入那几列。
+   *  `requeued`：因为缺它而等着的文件，这一存重新排进了处理队列几份 */
+  saveOcrSettings: (
+    workspaceId: string,
+    body: { base_url: string; api_key: string; backend: string },
+  ) =>
+    request<{ ok: boolean; requeued: number }>(
+      `/api/v1/workspaces/${workspaceId}/settings/ocr`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  saveTranscribeSettings: (
+    workspaceId: string,
+    body: { base_url: string; api_key: string; model: string },
+  ) =>
+    request<{ ok: boolean; requeued: number }>(
+      `/api/v1/workspaces/${workspaceId}/settings/transcribe`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+
+  /** 是否配置了单点登录（0056）。四项环境变量缺一个都是 false——
+   *  登录页据此决定要不要露出那个按钮 */
+  oidcStatus: () => request<{ enabled: boolean }>("/api/v1/auth/oidc/status"),
+  /** 谁的哪个身份提供方 subject 绑定到了这个部署的哪个账号（只读 + 解绑） */
+  oidcIdentities: () =>
+    request<{
+      issuer: string;
+      client_id: string;
+      redirect_uri: string;
+      identities: OidcIdentity[];
+    }>("/api/v1/admin/oidc/identities"),
+  /** 我自己的绑定。绑定本身走 `/api/v1/auth/oidc/start?link=1`，由本人在身份提供方那边完成 */
+  oidcMe: () =>
+    request<{ enabled: boolean; linked: boolean; subject?: string | null }>(
+      "/api/v1/auth/oidc/me",
+    ),
+  oidcUnlinkMe: () =>
+    request<{ ok: boolean }>("/api/v1/auth/oidc/me", { method: "DELETE" }),
+  /** 管理员解绑。没有替人绑定的接口——那是一条冒充别人登录的路 */
+  oidcUnlink: (userId: string) =>
+    request<{ ok: boolean }>(`/api/v1/admin/oidc/identities/${userId}`, {
+      method: "DELETE",
+    }),
 };
 
 /** RAG 对话：SSE 流式。返回中止函数。 */
@@ -1797,6 +2621,7 @@ export function reattachChat(
         signal,
       }),
     handlers,
+    true,
   );
 }
 
@@ -1822,57 +2647,95 @@ export function streamChat(
 function consumeChatStream(
   open: (signal: AbortSignal) => Promise<Response>,
   handlers: ChatHandlers,
+  allowIdle = false,
 ): () => void {
   const controller = new AbortController();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let terminal = false;
+  const fail = (message: string) => {
+    if (terminal || controller.signal.aborted) return;
+    terminal = true;
+    handlers.onError(message);
+  };
   (async () => {
     try {
       const res = await open(controller.signal);
+      if (controller.signal.aborted) {
+        await res.body?.cancel();
+        return;
+      }
       if (!res.ok || !res.body) {
         let message = res.statusText;
         try {
           const body = (await res.json()) as { error?: string };
           if (body.error) message = body.error;
-        } catch {
-          /* ignore */
-        }
-        handlers.onError(message);
+        } catch { /* keep the HTTP status */ }
+        fail(message);
         return;
       }
-      const reader = res.body.getReader();
+      reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buf = "";
-      for (;;) {
+      let line = "";
+      let skipLf = false;
+      let event = "message";
+      let data: string[] = [];
+      const dispatch = () => {
+        if (data.length === 0) return;
+        const value = data.join("\n");
+        if (event === "done") { terminal = true; handlers.onDone(); }
+        else if (event === "error") fail(value);
+        else if (event === "idle") {
+          if (allowIdle) { terminal = true; handlers.onIdle?.(); }
+          else fail(S.ask.streamInterrupted);
+        } else if (event === "conversation") handlers.onConversation(JSON.parse(value).id);
+        else if (event === "sources") handlers.onSources(JSON.parse(value));
+        else if (event === "step") handlers.onStep(JSON.parse(value));
+        else if (event === "delta") handlers.onDelta(JSON.parse(value).text);
+        else if (event === "snapshot") handlers.onSnapshot?.(JSON.parse(value));
+      };
+      const finishLine = () => {
+        if (line === "") {
+          dispatch();
+          event = "message";
+          data = [];
+        } else {
+          const colon = line.indexOf(":");
+          const field = colon < 0 ? line : line.slice(0, colon);
+          let value = colon < 0 ? "" : line.slice(colon + 1);
+          if (value.startsWith(" ")) value = value.slice(1);
+          if (field === "event") event = value;
+          else if (field === "data") data.push(value);
+        }
+        line = "";
+      };
+      while (!terminal && !controller.signal.aborted) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-          const frame = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          let event = "message";
-          let data = "";
-          for (const line of frame.split("\n")) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            else if (line.startsWith("data:")) data += line.slice(5).trim();
-          }
-          if (event === "conversation")
-            handlers.onConversation((JSON.parse(data) as { id: string }).id);
-          else if (event === "sources")
-            handlers.onSources(JSON.parse(data || "[]"));
-          else if (event === "step")
-            handlers.onStep(JSON.parse(data) as ChatStep);
-          else if (event === "delta")
-            handlers.onDelta((JSON.parse(data) as { text: string }).text);
-          else if (event === "snapshot") handlers.onSnapshot?.(JSON.parse(data));
-          else if (event === "idle") handlers.onIdle?.();
-          else if (event === "done") handlers.onDone();
-          else if (event === "error") handlers.onError(data);
+        if (done || controller.signal.aborted) break;
+        // CR is a complete line ending, even when its optional LF arrives in the
+        // next byte chunk. TextDecoder independently preserves split UTF-8.
+        for (const char of decoder.decode(value, { stream: true })) {
+          if (skipLf && char === "\n") { skipLf = false; continue; }
+          skipLf = false;
+          if (char === "\r" || char === "\n") {
+            finishLine();
+            skipLf = char === "\r";
+          } else line += char;
+          if (terminal || controller.signal.aborted) break;
         }
       }
-      handlers.onDone();
+      // EOF never dispatches an incomplete frame and is not an application done.
+      fail(S.ask.streamInterrupted);
     } catch (e) {
-      if (!controller.signal.aborted) handlers.onError(String(e));
+      fail(e instanceof SyntaxError ? S.ask.streamInterrupted : String(e));
+    } finally {
+      if (reader) {
+        try { await reader.cancel(); } catch { /* terminal/abort already decided */ }
+        reader.releaseLock();
+      }
     }
   })();
-  return () => controller.abort();
+  return () => {
+    controller.abort();
+    void reader?.cancel().catch(() => {});
+  };
 }

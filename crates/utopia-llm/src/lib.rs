@@ -24,6 +24,8 @@ pub struct ToolCall {
 /// 工具对话的一个 assistant 回合：文本与工具调用至少其一。
 #[derive(Debug)]
 pub struct AssistantTurn {
+    /// Preserve the provider value; absent is not an implicit `stop`.
+    pub finish_reason: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
@@ -62,15 +64,15 @@ pub enum ToolStreamItem {
 }
 
 /// **没能从端点拿到一个能解析的回答。** 两种：连不上（DNS、连接、TLS、超时），
-/// 或者连上了但回来的根本不是这个 API（响应体解不成 JSON）。
+/// 或者连上了、状态码说成功、可回来的东西解不成 JSON——根本不是这个 API。
 ///
 /// 合成一类是有意的：从用户那边看这两种是同一件事——"你配的这个地址不是模型 API"，
 /// 该做的也是同一件事：去看 URL、看代理。第一版只收传输层失败，结果最常见的那种
 /// 故障（URL 配错、代理挡在中间回了 HTML）一条告警都不产生，
 /// 正是"失败无声"本身。
 ///
-/// **不含**端点干干净净地回了 4xx/5xx：那说明它就是模型 API，只是密钥、
-/// 配额或模型名不对——另一类问题，该找的人也不同。
+/// **不含**端点回的 4xx/5xx，即使错误体不是 JSON：那说明服务器已经回答，
+/// 错误体本身就是诊断——另一类问题，该找的人也不同。
 ///
 /// 有类型而不是匹配错误文本：调用链上任何一层加一句 context 都会改文本，
 /// 而 `anyhow` 的 source 链让 `downcast_ref` 一路都认得出来。
@@ -103,6 +105,62 @@ pub fn rate_limited(err: &anyhow::Error) -> Option<&RateLimited> {
     err.chain().find_map(|e| e.downcast_ref::<RateLimited>())
 }
 
+/// 值得再试一次的那几类失败，连它们各自的「等多久」。**判据是「它会自己好」**：
+/// 端点在限流、端点这会儿不可用（502/503/504）、请求根本没送到（连接被重置、响应中断）。
+///
+/// **读超时不在里面。** `READ_TIMEOUT` 是 300 秒没有第一个字节，重试五次就是 25 分钟；
+/// 一个总是超时的调用不会因为多等而变好，它要的是更小的分块或更快的端点。
+///
+/// 实测一篇 32 块的文档在一小时里两类都撞上：502 四次、连接没送到两次。
+pub fn transient(err: &anyhow::Error) -> Option<(&'static str, Option<Duration>)> {
+    if let Some(hit) = rate_limited(err) {
+        return Some(("端点限流", hit.retry_after));
+    }
+    if let Some(hit) = unavailable(err) {
+        return Some(("端点不可用", hit.retry_after));
+    }
+    if err.chain().any(|e| e.is::<Interrupted>()) {
+        return Some(("流断在半路", None));
+    }
+    let sending = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<Unreachable>())
+        .filter(|u| !u.0.is_timeout());
+    sending.map(|_| ("请求没送到", None))
+}
+
+/// 端点开口了又半路没了：流断在一句话中间，既没有 `[DONE]` 也没有 `finish_reason`。
+///
+/// **做成类型是因为它长得像成功。** 拼到一半的回复是一段合法的字符串，调用方看不出
+/// 它本该更长；抽取会把它当成模型给的全部答案，少掉的那些陈述无声无息。
+#[derive(Debug, thiserror::Error)]
+#[error("LLM stream ended in the middle of the answer ({got} chars in)")]
+pub struct Interrupted {
+    /// 断掉时已经拼到多少字——报障时它说明「不是一开口就断」
+    pub got: usize,
+}
+
+/// 端点这会儿不可用：502 / 503 / 504，或者它自己说的 408。**跟 [`RateLimited`] 同一类，
+/// 理由也同一条：它会自己好。** 网关抽风、上游重启、排队超时都是几秒到几十秒的事，
+/// 而 400（提示词不合法）、401（密钥错）重试一万次还是错。
+///
+/// 混在 [`Rejected`] 里的代价实测过：本地代理对上游的一次 `fetch failed` 回 502，
+/// 32 块的一篇文档里随机几块就此报废，整篇抽取失败重来——一次调用 5% 的失败率，
+/// 一篇长文档第一遍几乎必失败（1 − 0.95³² ≈ 81%），而任务只重试三次。
+#[derive(Debug, thiserror::Error)]
+#[error("LLM endpoint is unavailable ({status}): {detail}")]
+pub struct Unavailable {
+    pub status: u16,
+    /// 端点给的 `Retry-After`（有则更准，多数不给）
+    pub retry_after: Option<Duration>,
+    pub detail: String,
+}
+
+/// anyhow 错误链里的 [`Unavailable`]，穿透 context 层。
+pub fn unavailable(err: &anyhow::Error) -> Option<&Unavailable> {
+    err.chain().find_map(|e| e.downcast_ref::<Unavailable>())
+}
+
 /// 账号付不起这次请求：欠费，或者套餐配额用尽。
 ///
 /// **跟 [`RateLimited`] 分开，因为它不会自己好。** 限流等一分钟就过去，
@@ -121,6 +179,29 @@ pub struct OutOfCredit {
 /// anyhow 错误链里的 [`OutOfCredit`]，穿透 context 层。
 pub fn out_of_credit(err: &anyhow::Error) -> Option<&OutOfCredit> {
     err.chain().find_map(|e| e.downcast_ref::<OutOfCredit>())
+}
+
+/// 端点回答了，而且回的是「不」：欠费与限流之外的所有非 2xx。
+///
+/// **做成类型是为了让状态码留下来。** 对话循环要在「这家不支持 tool calling」
+/// （400，请求形状被拒）与「网断了」「密钥错了」之间做不同的事：前者退成一次性
+/// RAG 还能答，后者退了也答不了。从前这一类只剩一段文本，状态码埋在字符串里，
+/// 于是循环把**任何**首轮错误都当成不支持工具——一次网络抖动就退成了 RAG，
+/// 然后 RAG 也死在同一个抖动上。
+#[derive(Debug, thiserror::Error)]
+#[error("{kind} request failed ({reason}): {detail}")]
+pub struct Rejected {
+    /// 哪一类请求（`LLM` / `Embedding`），只进错误文本
+    pub kind: String,
+    pub status: u16,
+    /// 状态码带原因短语，如 `400 Bad Request`——错误文本从前就是这么写的
+    pub reason: String,
+    pub detail: String,
+}
+
+/// anyhow 错误链里的 [`Rejected`]，穿透 context 层。
+pub fn rejected(err: &anyhow::Error) -> Option<&Rejected> {
+    err.chain().find_map(|e| e.downcast_ref::<Rejected>())
 }
 
 /// `Retry-After` 的整数秒形态。
@@ -147,8 +228,9 @@ fn failure(
     status: reqwest::StatusCode,
     retry_after: Option<Duration>,
     body: &serde_json::Value,
+    raw: &str,
 ) -> anyhow::Error {
-    let detail = err_detail(body);
+    let detail = err_detail(body, raw);
     // **欠费要先判，而且不能只看状态码。**
     //
     // 402 是标准答案（SiliconFlow 用它），但 OpenAI 的余额耗尽走的是 **429**，
@@ -168,7 +250,75 @@ fn failure(
             detail,
         });
     }
-    anyhow::anyhow!("{kind} request failed ({status}): {detail}")
+    // 网关与排队的那几个：等一等再来。**500 不在里面**——它可以是端点自己的 bug，
+    // 重试只是把同一个崩溃再触发一遍
+    if matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    ) {
+        return anyhow::Error::new(Unavailable {
+            status: status.as_u16(),
+            retry_after,
+            detail,
+        });
+    }
+    anyhow::Error::new(Rejected {
+        kind: kind.to_string(),
+        status: status.as_u16(),
+        reason: status.to_string(),
+        detail,
+    })
+}
+
+/// 把一个非成功状态的响应变成错误（#527）。
+///
+/// **先看状态码，再决定怎么读 body。** 从前成功与失败都先 `resp.json()`，于是一个回了
+/// 纯文本的 400——LM Studio 那句「request (105140 tokens) exceeds the available context」——
+/// 解不成 JSON 就被当成 `Unreachable`，报告者只好架代理抓包才看见它。现在 body 只按
+/// 原文读一次：是 JSON 就按几种常见形状取消息，不是就把原文截一段引出来。
+///
+/// 只有 body **读不出来**（连接半路断了）才仍是 `Unreachable`：那才是传输层的事。
+async fn response_failure(
+    kind: &str,
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    response: reqwest::Response,
+) -> anyhow::Result<anyhow::Error> {
+    let raw = response.text().await.map_err(Unreachable)?;
+    let body = serde_json::from_str(&raw).unwrap_or_default();
+    Ok(failure(kind, status, retry_after, &body, &raw))
+}
+
+/// 流式问答的结果：整段答案，连端点给的收尾原因。
+///
+/// **为什么原因要带出来**：`finish_reason: length` 是端点说「我是被截断的」，
+/// 而截断的回复长得和完整的一模一样——解析器只看得见 JSON 少了尾巴，看不见
+/// 少的原因。带着它，丢弃行才能说「撞上了 token 上限」，而不只是「解析不了」。
+#[derive(Debug)]
+pub struct Reply {
+    pub text: String,
+    /// 端点给的收尾原因（`stop` / `length` / …）。流里没有这一项就是 `None`：
+    /// 有的实现只发 `[DONE]`，缺席不代表答案是完整的
+    pub finish_reason: Option<String>,
+    /// 端点报的用量（最后一帧）。不报就是 `None`——账上不编数字
+    pub usage: Option<Usage>,
+}
+
+/// 一次调用的 token 用量，端点自己报的
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl Reply {
+    /// 端点说这段是被 token 上限截断的。
+    pub fn hit_token_ceiling(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
 }
 
 #[derive(Clone)]
@@ -198,6 +348,48 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 流水线停摆而**一条错误都不报**（jobs 的孤儿回收只在进程启动时跑一次，
 /// 进程活着就永远收不了尸）。7459 块的一次灌入死在第 55 块上。
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// **一次回复我们要多少 token**（#760）。
+///
+/// 不送这个字段，答案在哪里断由端点自己的默认值说了算：关掉推理时，一块密集
+/// 正文的答案实测停在**正好 4,096** 个 completion token 上，`finish_reason`
+/// 是 `length`，那段 JSON 于是解析不了。上限归我们，答案才在我们定的地方断。
+///
+/// 为什么是 65,536，而不是照着答案的长度定：`max_tokens` 在各家不是一个意思。
+/// Anthropic 把思考算在里面，OpenAI 的 `max_completion_tokens` 也把推理 token
+/// 算进去。在那样的端点上，这个数就不是答案的天花板，而是**思考的预算**——而
+/// 0044 的「What a reasoning cap costs」量过把思考压到一万五六：885 条陈述掉到
+/// 729，表格数字漏掉从 2% 涨到 16%。那正是被否掉的那个杆，不能让它从这里溜回来。
+///
+/// 这条路上量到的最大一次完成是 45,428 个 token（开着推理）。取它之上的一档，
+/// 于是它永远只是「防端点那 4,096 的默认值」，永远变不成推理上限。答案本身约
+/// 1,500 个 token，离这条线远得很。
+///
+/// **开着推理时这个端点不读它**——一次 capped 到 4,096 的调用回了 45,428 个
+/// completion token 还正常收尾。送它因此是「读的地方有用，不读的地方不亏」，
+/// 不是一条能指望所有端点都认的保证。
+const MAX_COMPLETION_TOKENS: u32 = 65_536;
+
+/// 推理模型的思考过程不该进下游（#690）。
+///
+/// DeepSeek-V4-Flash 这类推理模型把思考过程以内联 `<think>…</think>` 写进
+/// `message.content`，而不是单独的 `reasoning_content` 字段——这里本来就只读
+/// `content`，那个字段碰不到。后果在两处当场撞见：`settings/test` 拿回
+/// `"OK</think>OK"`；抽取的 `json_block` 取"第一个 `{` 到最后一个 `}`"，
+/// 思考过程里的一对大括号就能把起止位置带偏。
+///
+/// 切掉**最后一个** `</think>` 之前的一切：它是协议标记，不是正文词汇；
+/// 取最后一个，是防着正文里引用它。没有标记就原样返回——非推理模型
+/// 走这里不受影响。
+///
+/// 只管非流式 `chat`：抽取、裁决、连通性测试都走它。流式路径逐片向界面吐字，
+/// 前半截切掉会让已吐出的字对不上号，那是另一题，不管。
+fn strip_reasoning(reply: &str) -> &str {
+    match reply.rfind("</think>") {
+        Some(pos) => &reply[pos + "</think>".len()..],
+        None => reply,
+    }
+}
 
 impl LlmClient {
     pub fn new(base_url: &str, api_key: Option<&str>, model: &str) -> Self {
@@ -238,25 +430,187 @@ impl LlmClient {
         req
     }
 
-    /// 非流式对话（连通性测试等轻量场景）。
+    /// 非流式对话（连通性测试等轻量场景）。不传温度：请求体与从前一字不变，端点用它的缺省
     pub async fn chat(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
+        self.chat_at(messages, None).await
+    }
+
+    /// 非流式对话，指定采样温度。抽取这类「照抄原文」的活要 0：端点缺省是 1.0，同一段
+    /// 文字连问两次，一次给 6 条陈述一次给 19 条（#729 实测），密度全看运气
+    pub async fn chat_at(
+        &self,
+        messages: &[ChatMessage],
+        temperature: Option<f32>,
+    ) -> anyhow::Result<String> {
+        let mut body = json!({ "model": self.model, "messages": messages, "stream": false });
+        if let Some(t) = temperature {
+            body["temperature"] = json!(t);
+        }
         let resp = self
             .request("/chat/completions")
-            .json(&json!({ "model": self.model, "messages": messages, "stream": false }))
+            .json(&body)
             .send()
             .await
             .map_err(Unreachable)?;
         let status = resp.status();
         let retry_after = retry_after_of(resp.headers());
-        let body: serde_json::Value = resp.json().await.map_err(Unreachable)?;
         if !status.is_success() {
-            return Err(failure("LLM", status, retry_after, &body));
+            return Err(response_failure("LLM", status, retry_after, resp).await?);
         }
+        let body: serde_json::Value = resp.json().await.map_err(Unreachable)?;
         log_usage(&self.model, &body);
         body["choices"][0]["message"]["content"]
             .as_str()
-            .map(String::from)
+            .map(|s| strip_reasoning(s).to_string())
             .ok_or_else(|| anyhow::anyhow!("Unexpected LLM response shape: {body}"))
+    }
+
+    /// 一次问答，**走流式但整段返回**：调用方拿到的和 [`Self::chat_at`] 一样是一个
+    /// 字符串，区别只在字节怎么到。
+    ///
+    /// **为什么长提示词的那几条路要用它**：[`READ_TIMEOUT`] 量的是「多久没有新字节」，
+    /// 而非流式调用的第一个字节要等模型把整段生成完——于是模型思考的时间全部算作沉默。
+    /// 开着推理，一块密集的正文实测首字节 227 秒、偶尔越过 300 秒被判死；同一块流式下
+    /// 2.6 秒就有字节（思考过程在流），总时长一样是 230 秒左右。流式不会更快，它让
+    /// 「沉默」回到它本来的意思，超时于是只杀真正卡住的请求。
+    ///
+    /// 思考过程不进返回值：只收 `delta.content`，推理的增量（`reasoning` /
+    /// `reasoning_content`）读都不读；`<think>` 混在 content 里的那种照旧由
+    /// [`strip_reasoning`] 切掉。
+    pub async fn chat_at_streaming(
+        &self,
+        messages: &[ChatMessage],
+        temperature: Option<f32>,
+    ) -> anyhow::Result<Reply> {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": true,
+            // 用量随最后一帧回来：比较两次运行的第一件事是看 completion token，
+            // 换成流式不能把这个数弄丢
+            "stream_options": { "include_usage": true },
+            // 上限归我们，不归端点的默认值（[`MAX_COMPLETION_TOKENS`]）
+            "max_tokens": MAX_COMPLETION_TOKENS,
+        });
+        if let Some(t) = temperature {
+            body["temperature"] = json!(t);
+        }
+        let resp = self
+            .request("/chat/completions")
+            .json(&body)
+            .send()
+            .await
+            .map_err(Unreachable)?;
+        let status = resp.status();
+        let retry_after = retry_after_of(resp.headers());
+        if !status.is_success() {
+            return Err(response_failure("LLM", status, retry_after, resp).await?);
+        }
+        let mut bytes = resp.bytes_stream();
+        let (mut buf, mut answer) = (Vec::new(), String::new());
+        let (mut saw_frame, mut ended) = (false, false);
+        let mut finish_reason: Option<String> = None;
+        let mut usage: Option<Usage> = None;
+        while let Some(part) = bytes.next().await {
+            let part = part.map_err(Unreachable)?;
+            // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
+            buf.extend_from_slice(&part);
+            // SSE 帧以空行分隔；最后一个不完整的帧留在 buf 里等下一片
+            while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                buf.drain(..pos + 2);
+                self.take_frame(
+                    &frame,
+                    &mut answer,
+                    &mut saw_frame,
+                    &mut ended,
+                    &mut finish_reason,
+                    &mut usage,
+                );
+            }
+        }
+        // **收尾那一帧也算**：末尾不跟空行的实现有的是，丢掉它就是丢掉答案的尾巴
+        let rest = String::from_utf8_lossy(&buf);
+        if !rest.trim().is_empty() {
+            self.take_frame(
+                &rest,
+                &mut answer,
+                &mut saw_frame,
+                &mut ended,
+                &mut finish_reason,
+                &mut usage,
+            );
+        }
+        if !saw_frame {
+            anyhow::bail!("LLM stream carried no frames");
+        }
+        if let Some(u) = usage {
+            tracing::info!(
+                model = %self.model,
+                prompt = u.prompt_tokens,
+                completion = u.completion_tokens,
+                "llm usage"
+            );
+        }
+        // 端点开口了又半路没了：拼到一半的回复长得像成功，不做成错误就会被当成
+        // 模型给的全部答案
+        if !ended {
+            return Err(anyhow::Error::new(Interrupted {
+                got: answer.chars().count(),
+            }));
+        }
+        Ok(Reply {
+            text: strip_reasoning(&answer).to_string(),
+            finish_reason,
+            usage,
+        })
+    }
+
+    /// 一个 SSE 帧：取内容增量、认终止信号、顺手记用量。推理的增量读都不读。
+    fn take_frame(
+        &self,
+        frame: &str,
+        answer: &mut String,
+        saw_frame: &mut bool,
+        ended: &mut bool,
+        finish_reason: &mut Option<String>,
+        usage: &mut Option<Usage>,
+    ) {
+        for line in frame.lines() {
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                *ended = true;
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            *saw_frame = true;
+            if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                answer.push_str(delta);
+            }
+            // 模型自己说完了：正常收尾（stop）或撞上它的输出上限（length），两种都是
+            // 端点把话说完了，与「流断在半路」不同。
+            //
+            // 是哪一种要留下来：两种都让 `ended` 为真，可 `length` 的回复是半截的，
+            // 不带出去就只剩「解析不了」，说不出它为什么不全（#760）
+            if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
+                *ended = true;
+                *finish_reason = Some(reason.to_string());
+            }
+            // 用量只在最后一帧（choices 为空）出现
+            // 有的网关每一帧都带累计用量：这里只记下来，流结束时记一次日志，否则一次调用
+            // 在日志里成了几百行「用量」，按行加总的人会把 token 高估几百倍
+            if !v["usage"].is_null() {
+                let u = &v["usage"];
+                *usage = Some(Usage {
+                    prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                    completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                });
+            }
+        }
     }
 
     /// 工具对话（非流式）：messages 为 OpenAI 协议原始 JSON
@@ -266,23 +620,61 @@ impl LlmClient {
         messages: &[serde_json::Value],
         tools: &serde_json::Value,
     ) -> anyhow::Result<AssistantTurn> {
+        self.chat_tools_with(messages, Some(tools), None).await
+    }
+
+    /// 带工具的请求体。`tools` 为 None 就不带工具字段——**不是空数组**：
+    /// 有的端点见到 `"tools": []` 会 400。`tool_choice` 按 OpenAI 协议原样透传
+    /// （`"auto"` / `"none"` / `"required"` / `{"type":"function",...}`），
+    /// 也只在给了的时候才写进去。
+    fn tools_body(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&serde_json::Value>,
+        stream: bool,
+    ) -> serde_json::Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": stream,
+        });
+        if let Some(tools) = tools {
+            body["tools"] = tools.clone();
+            if let Some(choice) = tool_choice {
+                body["tool_choice"] = choice.clone();
+            }
+        }
+        body
+    }
+
+    /// Exact serialized streaming request size, including model and protocol fields.
+    /// Used by the bounded answer phase before any network I/O.
+    pub fn tool_free_request_bytes(&self, messages: &[serde_json::Value]) -> usize {
+        self.tools_body(messages, None, None, true)
+            .to_string()
+            .len()
+    }
+
+    /// 工具对话（非流式），工具清单与 `tool_choice` 都可选。
+    pub async fn chat_tools_with(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&serde_json::Value>,
+    ) -> anyhow::Result<AssistantTurn> {
         let resp = self
             .request("/chat/completions")
-            .json(&json!({
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-                "stream": false,
-            }))
+            .json(&self.tools_body(messages, tools, tool_choice, false))
             .send()
             .await
             .map_err(Unreachable)?;
         let status = resp.status();
         let retry_after = retry_after_of(resp.headers());
-        let body: serde_json::Value = resp.json().await.map_err(Unreachable)?;
         if !status.is_success() {
-            return Err(failure("LLM", status, retry_after, &body));
+            return Err(response_failure("LLM", status, retry_after, resp).await?);
         }
+        let body: serde_json::Value = resp.json().await.map_err(Unreachable)?;
         let msg = &body["choices"][0]["message"];
         if msg.is_null() {
             anyhow::bail!("Unexpected LLM response shape: {body}");
@@ -312,6 +704,9 @@ impl LlmClient {
         Ok(AssistantTurn {
             content,
             tool_calls,
+            finish_reason: body["choices"][0]["finish_reason"]
+                .as_str()
+                .map(String::from),
         })
     }
 
@@ -322,35 +717,42 @@ impl LlmClient {
         messages: &[serde_json::Value],
         tools: &serde_json::Value,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ToolStreamItem>> + Send + use<>> {
+        self.chat_tools_stream_with(messages, Some(tools), None)
+            .await
+    }
+
+    /// 工具对话（流式），工具清单与 `tool_choice` 都可选；见 [`Self::chat_tools_stream`]。
+    pub async fn chat_tools_stream_with(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&serde_json::Value>,
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ToolStreamItem>> + Send + use<>> {
         let resp = self
             .request("/chat/completions")
-            .json(&json!({
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-                "stream": true,
-            }))
+            .json(&self.tools_body(messages, tools, tool_choice, true))
             .send()
             .await
             .map_err(Unreachable)?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = retry_after_of(resp.headers());
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            return Err(failure("LLM", status, retry_after, &body));
+            return Err(response_failure("LLM", status, retry_after, resp).await?);
         }
 
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
-            let mut buf = String::new();
+            let mut buf = Vec::new();
             let mut content = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
+            let mut finish_reason = None;
             let mut done = false;
             'outer: while let Some(part) = bytes.next().await {
                 let part = part?;
-                buf.push_str(&String::from_utf8_lossy(&part));
-                while let Some(pos) = buf.find("\n\n") {
-                    let frame = buf[..pos].to_string();
+                // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
+                buf.extend_from_slice(&part);
+                while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                    let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
                     buf.drain(..pos + 2);
                     for line in frame.lines() {
                         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
@@ -363,6 +765,10 @@ impl LlmClient {
                         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                             continue;
                         };
+                        if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
+                            finish_reason = Some(reason.to_string());
+                            done = true;
+                        }
                         let delta = &v["choices"][0]["delta"];
                         if let Some(text) = delta["content"].as_str() {
                             if !text.is_empty() {
@@ -395,10 +801,14 @@ impl LlmClient {
                     }
                 }
             }
-            let _ = done;
+            // HTTP 正常结束也可能只送到半个模型回合，不能把没收完的工具调用
+            // 当作完整回合交给 agent。
+            if !done {
+                Err(Interrupted { got: content.chars().count() })?;
+            }
             calls.retain(|c| !c.name.is_empty());
             let content = if content.is_empty() { None } else { Some(content) };
-            yield ToolStreamItem::Turn(AssistantTurn { content, tool_calls: calls });
+            yield ToolStreamItem::Turn(AssistantTurn { content, tool_calls: calls, finish_reason });
         };
         Ok(stream)
     }
@@ -429,19 +839,21 @@ impl LlmClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = retry_after_of(resp.headers());
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            return Err(failure("LLM", status, retry_after, &body));
+            return Err(response_failure("LLM", status, retry_after, resp).await?);
         }
 
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
-            let mut buf = String::new();
+            let mut buf = Vec::new();
+            let mut ended = false;
+            let mut got = 0;
             while let Some(part) = bytes.next().await {
                 let part = part?;
-                buf.push_str(&String::from_utf8_lossy(&part));
+                // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
+                buf.extend_from_slice(&part);
                 // SSE 帧以空行分隔；逐帧取出已完整到达的部分
-                while let Some(pos) = buf.find("\n\n") {
-                    let frame = buf[..pos].to_string();
+                while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                    let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
                     buf.drain(..pos + 2);
                     for line in frame.lines() {
                         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
@@ -451,14 +863,21 @@ impl LlmClient {
                             return;
                         }
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                            if v["choices"][0]["finish_reason"].is_string() {
+                                ended = true;
+                            }
                             if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
                                 if !delta.is_empty() {
+                                    got += delta.chars().count();
                                     yield delta.to_string();
                                 }
                             }
                         }
                     }
                 }
+            }
+            if !ended {
+                Err(Interrupted { got })?;
             }
         };
         Ok(stream)
@@ -474,15 +893,47 @@ impl LlmClient {
             .map_err(Unreachable)?;
         let status = resp.status();
         let retry_after = retry_after_of(resp.headers());
-        let body: serde_json::Value = resp.json().await.map_err(Unreachable)?;
         if !status.is_success() {
-            return Err(failure("Embedding", status, retry_after, &body));
+            return Err(response_failure("Embedding", status, retry_after, resp).await?);
         }
+        let body: serde_json::Value = resp.json().await.map_err(Unreachable)?;
         let data = body["data"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Unexpected embedding response shape"))?;
-        let mut out = Vec::with_capacity(data.len());
-        for item in data {
+        // 调用方把这些向量和输入的文本按位置配对。响应里写了 index，那它才是配对的
+        // 依据——网关把条目打乱了顺序也认得回来。
+        //
+        // **看值，不看键**：`get("index")` 对 `"index": null` 也返回 Some，而兼容端点
+        // 写个空值、写成字符串的都有。按键判断会把它们送进索引分支，再在 `as_u64` 上
+        // 报错，于是今天能用的响应明天整批失败。取不出数就当它没有索引，照旧按位置配。
+        let items: Vec<&serde_json::Value> = if data.iter().any(|item| {
+            item.get("index")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        }) {
+            let mut ordered = vec![None; texts.len()];
+            for item in data {
+                let index = item["index"]
+                    .as_u64()
+                    .and_then(|i| usize::try_from(i).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Embedding response has a missing or invalid index")
+                    })?;
+                let slot = ordered
+                    .get_mut(index)
+                    .ok_or_else(|| anyhow::anyhow!("Embedding response index is out of range"))?;
+                anyhow::ensure!(slot.is_none(), "Embedding response has a duplicate index");
+                *slot = Some(item);
+            }
+            ordered
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| anyhow::anyhow!("Embedding response is missing an input index"))?
+        } else {
+            data.iter().collect()
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
             let v = item["embedding"]
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("Embedding 响应缺少向量"))?
@@ -519,12 +970,26 @@ fn log_usage(model: &str, body: &serde_json::Value) {
     );
 }
 
-fn err_detail(body: &serde_json::Value) -> String {
+/// 引用原文时最多带多少字。到目前见过的诊断没有一条超过它，而这段字会进日志、
+/// 告警和文档的错误栏，一个回 HTML 页面的代理不该把整页塞进去。按字符数不按字节，
+/// 中文错误信息切在字符中间就成了乱码。
+const MAX_ERROR_DETAIL_CHARS: usize = 500;
+
+/// 从错误体里取一句给人看的话。依次试 OpenAI 的 `error.message`、SiliconFlow 那种
+/// 顶层 `message`、以及 `error` 直接是一个字符串的写法；都不是就引用原文本身。
+/// 「unknown error」只留给 body 真的是空的那种情况——它从前是所有认不出的形状的
+/// 归宿，把最有用的那句话吞掉了（#527）。
+fn err_detail(body: &serde_json::Value, raw: &str) -> String {
     body["error"]["message"]
         .as_str()
         .or_else(|| body["message"].as_str())
-        .unwrap_or("unknown error")
-        .to_string()
+        .or_else(|| body["error"].as_str())
+        .map(String::from)
+        .or_else(|| {
+            let raw = raw.trim();
+            (!raw.is_empty()).then(|| raw.chars().take(MAX_ERROR_DETAIL_CHARS).collect())
+        })
+        .unwrap_or_else(|| "unknown error".to_string())
 }
 
 /// 响应体说不说这是余额问题。
@@ -545,6 +1010,765 @@ fn says_out_of_credit(body: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn client_at(addr: std::net::SocketAddr) -> LlmClient {
+        LlmClient::new(&format!("http://{addr}"), None, "m")
+    }
+
+    fn no_tools() -> serde_json::Value {
+        serde_json::json!([])
+    }
+
+    /// 把请求整个读完：头读到空行，正文按 Content-Length。
+    ///
+    /// **必须先读再答。** 收到的数据还没读就关连接，Windows 会发 RST，客户端那边
+    /// 已经到手的响应连同错误一起变成「连接被中止」（os error 10053）——这组测试
+    /// 在 Linux 上绿、在 Windows 上红，就是这个原因
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                return String::from_utf8_lossy(&buf).into_owned();
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let want: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() - header_end < want {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// 一个只答一次的 HTTP 服务：读完请求，把这份响应原样写回去，关掉。
+    /// 用裸 socket 而不是 mock 库，是因为要造的正是「不像模型 API 的回答」——
+    /// 纯文本、不完整、什么都行。返回的句柄要 await：它跑完才说明响应真的发出去了
+    async fn an_http_response(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        (addr, server)
+    }
+
+    /// 同上，另外把**请求**原样交回来：要断言的是我们发出去了什么
+    /// （`max_tokens` 有没有真的写进请求体），不是端点答了什么。
+    async fn an_http_response_capturing(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let status = status.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let _ = tx.send(request);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        (addr, server, rx)
+    }
+
+    // HTTP 分块可以断在 UTF-8 字符中间，与 SSE 帧边界无关。
+    async fn bytewise_sse(body: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.as_bytes().to_vec();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            for byte in body {
+                socket
+                    .write_all(&[b'1', b'\r', b'\n', byte, b'\r', b'\n'])
+                    .await
+                    .unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        (addr, server)
+    }
+
+    fn unicode_sse() -> String {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{"delta": {"content": "你好🦀", "tool_calls": [{
+                    "index": 0, "id": "call_1", "function": {
+                        "name": "search", "arguments": "{\"city\":\"杭州\"}"
+                    }
+                }]}}]
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn bytewise_utf8_survives_collected_streaming() {
+        let (addr, server) = bytewise_sse(&unicode_sse()).await;
+        // 这一刀之后整段回复带着 finish_reason 一起回来，正文在 `text` 上
+        let answer = client_at(addr).chat_at_streaming(&[], None).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(answer.text, "你好🦀");
+    }
+
+    #[tokio::test]
+    async fn bytewise_utf8_survives_raw_streaming() {
+        use futures_util::TryStreamExt;
+        let (addr, server) = bytewise_sse(&unicode_sse()).await;
+        let stream = client_at(addr).chat_stream_raw(&[]).await.unwrap();
+        let answer: Vec<String> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(answer.concat(), "你好🦀");
+    }
+
+    #[tokio::test]
+    async fn bytewise_utf8_survives_tool_streaming() {
+        use futures_util::TryStreamExt;
+        let (addr, server) = bytewise_sse(&unicode_sse()).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+        server.await.unwrap();
+        let [ToolStreamItem::Delta(delta), ToolStreamItem::Turn(turn)] = items.as_slice() else {
+            panic!("expected a delta and completed turn: {items:?}");
+        };
+        assert_eq!(delta, "你好🦀");
+        assert_eq!(turn.content.as_deref(), Some("你好🦀"));
+        assert_eq!(turn.tool_calls.len(), 1);
+    }
+
+    async fn an_http_error(body: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        an_http_response("502 Bad Gateway", "text/plain", body).await
+    }
+
+    /// 声称 body 有 100 字节、只发 1 个就挂断：读 body 会半路失败
+    async fn an_incomplete_http_error() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        (addr, server)
+    }
+
+    /// 错误里带着端点那句话，且没被判成 Unreachable
+    async fn assert_diagnosis<T>(
+        result: anyhow::Result<T>,
+        diagnosis: &str,
+        server: tokio::task::JoinHandle<()>,
+    ) {
+        server.await.unwrap();
+        let error = match result {
+            Ok(_) => panic!("the endpoint returned an error response"),
+            Err(error) => error,
+        };
+        assert!(!is_unreachable(&error));
+        assert!(error.to_string().contains(diagnosis), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn an_interruption_counts_characters_in_all_three_readers() {
+        use futures_util::TryStreamExt;
+        let sse = format!(
+            "data: {}\n\n",
+            json!({ "choices": [{"delta": {"content": "你好🦀"}}] })
+        );
+        for reader in ["collected", "raw", "tools"] {
+            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+            let client = client_at(addr);
+            let error = match reader {
+                "collected" => client.chat_at_streaming(&[], None).await.unwrap_err(),
+                "raw" => client
+                    .chat_stream_raw(&[])
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_err(),
+                _ => client
+                    .chat_tools_stream_with(&[], None, None)
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_err(),
+            };
+            server.await.unwrap();
+            assert_eq!(
+                error.downcast_ref::<Interrupted>().unwrap().got,
+                3,
+                "{reader}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_raw_stream_cut_before_its_finish_is_an_error() {
+        use futures_util::TryStreamExt;
+        let sse = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{"delta": {"content": "partial answer"}}]
+            })
+        );
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr).chat_stream_raw(&[]).await.unwrap();
+        let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.downcast_ref::<Interrupted>().is_some(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_stream_cut_before_its_finish_is_an_error() {
+        use futures_util::TryStreamExt;
+        let sse = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "function": {
+                        "name": "lookup", "arguments": "{\"name\":"
+                    }
+                }]}}]
+            })
+        );
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.downcast_ref::<Interrupted>().is_some(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn tool_turns_preserve_finish_reasons_in_both_transports() {
+        use futures_util::TryStreamExt;
+        for reason in [
+            None,
+            Some("stop"),
+            Some("length"),
+            Some("tool_calls"),
+            Some("content_filter"),
+            Some("vendor_specific"),
+        ] {
+            let body = json!({"choices":[{"message":{"content":"answer"},"finish_reason":reason}]})
+                .to_string();
+            let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+            let turn = client_at(addr)
+                .chat_tools_with(&[], None, None)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(turn.finish_reason.as_deref(), reason);
+            let frame = json!({"choices":[{"delta":{"content":"answer"},"finish_reason":reason}]});
+            let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+            let stream = client_at(addr)
+                .chat_tools_stream_with(&[], None, None)
+                .await
+                .unwrap();
+            let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+            server.await.unwrap();
+            let Some(ToolStreamItem::Turn(turn)) = items.last() else {
+                panic!("missing turn")
+            };
+            assert_eq!(turn.finish_reason.as_deref(), reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn either_finish_signal_completes_raw_and_tool_streams() {
+        use futures_util::TryStreamExt;
+        for ending in [
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ] {
+            let sse = format!(
+                "data: {}\n\n{ending}",
+                json!({
+                    "choices": [{"delta": {"content": "whole answer"}}]
+                })
+            );
+            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+            let stream = client_at(addr).chat_stream_raw(&[]).await.unwrap();
+            let chunks: Vec<String> = stream.try_collect().await.unwrap();
+            server.await.unwrap();
+            assert_eq!(chunks.concat(), "whole answer");
+            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+            let stream = client_at(addr)
+                .chat_tools_stream_with(&[], None, None)
+                .await
+                .unwrap();
+            let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+            server.await.unwrap();
+            let Some(ToolStreamItem::Turn(turn)) = items.last() else {
+                panic!("missing completed turn")
+            };
+            assert_eq!(turn.content.as_deref(), Some("whole answer"));
+        }
+    }
+
+    /// 流式的一次问答收成整段：只要 `delta.content`，推理的增量不进返回值，
+    /// 用量那一帧不当内容，没有一帧是错（端点开了流却什么都没发）
+    #[tokio::test]
+    async fn a_streamed_answer_arrives_whole_without_its_reasoning() {
+        let sse = [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"e\\\":[\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"]}\"}}]}",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":9000}}",
+            "data: [DONE]",
+            "",
+        ]
+        .join(
+            "
+
+",
+        );
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let answer = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                Some(0.0),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(answer.text, "{\"e\":[]}", "只收 content 的增量，拼成整段");
+
+        // 开了流却一帧都没发：那不是空答案，那是没答
+        // 末帧不跟空行：尾巴不能丢
+        let tail = "data: {\"choices\":[{\"delta\":{\"content\":\"head\"}}]}
+
+data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}";
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", tail).await;
+        let answer = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(answer.text, "headtail", "最后一帧没有空行收尾，也要算进去");
+        assert_eq!(
+            answer.finish_reason.as_deref(),
+            Some("stop"),
+            "端点给的收尾原因要带出来"
+        );
+
+        // 开口了又半路没了：那不是一个短答案，那是没答完，值得再试一次
+        let cut = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"}}]}
+
+";
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", cut).await;
+        let err = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                None,
+            )
+            .await
+            .expect_err("断在半路该是错误");
+        server.await.unwrap();
+        assert_eq!(
+            crate::transient(&err).map(|(w, _)| w),
+            Some("流断在半路"),
+            "{err:#}"
+        );
+
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", "").await;
+        let err = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                None,
+            )
+            .await
+            .expect_err("没有帧该是错误");
+        server.await.unwrap();
+        assert!(format!("{err:#}").contains("no frames"), "{err:#}");
+    }
+
+    /// 上限归我们，被截断这件事说得出来（#760）。
+    ///
+    /// 两件事一起测，因为它们是同一个毛病的两半：不送 `max_tokens`，答案在哪里
+    /// 断由端点的默认值说了算；送了却把 `finish_reason` 丢掉，断了也没人知道为什么。
+    #[tokio::test]
+    async fn a_token_ceiling_is_ours_and_a_cut_reply_says_so() {
+        // `length` = 端点说「我是撞上上限停的」。这样的回复长得和正常收尾一模一样
+        let cut = [
+            r#"data: {"choices":[{"delta":{"content":"{\"e\":[{\"n\":\"half"}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join(
+            "
+
+",
+        );
+        let (addr, server, request) =
+            an_http_response_capturing("200 OK", "text/event-stream", &cut).await;
+        let reply = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                Some(0.0),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        // 一、请求里真的带了上限，而且是我们那个数
+        let sent = request.await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(sent.split_once("\r\n\r\n").expect("请求该有 body").1)
+                .expect("请求体是 JSON");
+        assert_eq!(
+            body["max_tokens"],
+            json!(MAX_COMPLETION_TOKENS),
+            "不送这个字段，答案断在哪里就是端点的默认值说了算：{body}"
+        );
+
+        // 二、被截断这件事到得了调用方。答案照旧是完整的那半段——半截的回复
+        // 仍然有价值，丢的是尾巴不是全部
+        assert!(reply.hit_token_ceiling(), "{:?}", reply.finish_reason);
+        assert_eq!(reply.finish_reason.as_deref(), Some("length"));
+        assert!(reply.text.starts_with(r#"{"e":["#), "{}", reply.text);
+
+        // 正常收尾不是截断：两者都让流正常结束，只有原因分得开
+        let whole =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", whole).await;
+        let reply = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(!reply.hit_token_ceiling(), "stop 不是截断");
+    }
+
+    /// 会自己好的与不会自己好的分开：网关那几个是 [`Unavailable`]，密钥错那类照旧
+    /// 是 [`Rejected`]，欠费与限流各归各位。调用方据此决定「等一会儿再来」还是「这块废了」
+    #[tokio::test]
+    async fn a_gateway_failure_is_transient_and_a_bad_key_is_not() {
+        for status in [
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
+            "408 Request Timeout",
+        ] {
+            let (addr, server) = an_http_response(status, "text/plain", "upstream hiccup").await;
+            let err = client_at(addr)
+                .chat(&[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }])
+                .await
+                .expect_err("非成功状态该是错误");
+            server.await.unwrap();
+            let hit = crate::unavailable(&err)
+                .unwrap_or_else(|| panic!("{status} 该是会自己好的那一类：{err:#}"));
+            assert_eq!(hit.status, status[..3].parse::<u16>().unwrap());
+            assert!(
+                format!("{err:#}").contains("upstream hiccup"),
+                "原话要带出来：{err:#}"
+            );
+        }
+
+        // 请求根本没送到（连不上）：也是会自己好的一类
+        let nowhere = ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        };
+        let dead = LlmClient::new("http://127.0.0.1:1", None, "m");
+        let err = dead.chat(&[nowhere]).await.expect_err("连不上该是错误");
+        assert!(crate::is_unreachable(&err), "{err:#}");
+        assert_eq!(
+            crate::transient(&err).map(|(w, _)| w),
+            Some("请求没送到"),
+            "{err:#}"
+        );
+
+        // 密钥错、请求不合法：重试一万次还是错，不能混进去
+        for status in [
+            "401 Unauthorized",
+            "400 Bad Request",
+            "500 Internal Server Error",
+        ] {
+            let (addr, server) = an_http_response(status, "text/plain", "no").await;
+            let err = client_at(addr)
+                .chat(&[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }])
+                .await
+                .expect_err("非成功状态该是错误");
+            server.await.unwrap();
+            assert!(
+                crate::unavailable(&err).is_none(),
+                "{status} 不该被当成会自己好的：{err:#}"
+            );
+            assert!(
+                crate::rate_limited(&err).is_none(),
+                "{status} 不是限流：{err:#}"
+            );
+        }
+    }
+
+    /// #527 的正题：一个回纯文本的 502，五条请求路径（对话、工具对话、两种流式、嵌入）
+    /// 都要把那句话原样带出来，而不是报「unknown error」或「连不上」。
+    #[tokio::test]
+    async fn a_body_that_is_not_json_is_quoted_and_not_called_unreachable() {
+        let diagnosis = "proxy says the model context is too long";
+        let (addr, server) = an_http_error(diagnosis).await;
+        let client = client_at(addr);
+        assert_diagnosis(
+            client
+                .chat(&[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }])
+                .await,
+            diagnosis,
+            server,
+        )
+        .await;
+
+        let (addr, server) = an_http_error(diagnosis).await;
+        let client = client_at(addr);
+        assert_diagnosis(client.chat_tools(&[], &no_tools()).await, diagnosis, server).await;
+
+        let (addr, server) = an_http_error(diagnosis).await;
+        let client = client_at(addr);
+        assert_diagnosis(
+            client.chat_tools_stream(&[], &no_tools()).await,
+            diagnosis,
+            server,
+        )
+        .await;
+
+        let (addr, server) = an_http_error(diagnosis).await;
+        let client = client_at(addr);
+        assert_diagnosis(
+            client
+                .chat_stream(&[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }])
+                .await,
+            diagnosis,
+            server,
+        )
+        .await;
+
+        let (addr, server) = an_http_error(diagnosis).await;
+        let client = client_at(addr);
+        assert_diagnosis(client.embed(&["hi".to_string()]).await, diagnosis, server).await;
+    }
+
+    /// 反面：body 读到一半连接断了，这是传输层的事，仍归 Unreachable——
+    /// 别把「引用原文」做过头，把真的连接故障也说成端点的诊断
+    #[tokio::test]
+    async fn a_body_that_cannot_be_read_stays_unreachable() {
+        let (addr, server) = an_incomplete_http_error().await;
+        let client = client_at(addr);
+        let result = client.chat(&[]).await;
+        server.await.unwrap();
+        let error = result.expect_err("the body is incomplete");
+        assert!(
+            is_unreachable(&error),
+            "body read error lost its source: {error:#}"
+        );
+    }
+
+    /// 成功路径原样：状态码先行没有改变成功响应的解析
+    #[tokio::test]
+    async fn successful_responses_still_parse() {
+        let (addr, server) = an_http_response(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        )
+        .await;
+        let client = client_at(addr);
+        let result = client.chat(&[]).await;
+        server.await.unwrap();
+        assert_eq!(result.unwrap(), "ok");
+
+        let (addr, server) = an_http_response(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        )
+        .await;
+        let client = client_at(addr);
+        let result = client.chat_tools(&[], &no_tools()).await;
+        server.await.unwrap();
+        assert_eq!(result.unwrap().content.as_deref(), Some("ok"));
+
+        let (addr, server) = an_http_response(
+            "200 OK",
+            "application/json",
+            r#"{"data":[{"embedding":[1.0]}]}"#,
+        )
+        .await;
+        let client = client_at(addr);
+        let result = client.embed(&["hi".to_string()]).await;
+        server.await.unwrap();
+        assert_eq!(result.unwrap(), vec![vec![1.0]]);
+    }
+
+    /// #690 的正题：推理模型把思考过程以内联 `<think>` 写进回复正文，
+    /// `chat` 只返回标记之后的那半——抽取、裁决、连通性测试都读它。
+    /// 思考过程里特意放一对大括号：`json_block` 取"第一个 `{` 到最后一个 `}`"，
+    /// 不切掉这里，下游就会卡在思考过程里取错起止。
+    #[tokio::test]
+    async fn a_reasoning_reply_keeps_only_what_follows_think() {
+        let (addr, server) = an_http_response(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"让我想想 {\"a\": 1}。\n</think>{\"facts\": []}"}}]}"#,
+        )
+        .await;
+        let client = client_at(addr);
+        let result = client.chat(&[]).await;
+        server.await.unwrap();
+        assert_eq!(result.unwrap(), r#"{"facts": []}"#);
+    }
+
+    /// 反面：没有标记的回复原样返回——非推理模型走这里不受影响
+    #[tokio::test]
+    async fn a_reply_without_a_think_marker_is_untouched() {
+        let (addr, server) = an_http_response(
+            "200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"{\"facts\": []}"}}]}"#,
+        )
+        .await;
+        let client = client_at(addr);
+        let result = client.chat(&[]).await;
+        server.await.unwrap();
+        assert_eq!(result.unwrap(), r#"{"facts": []}"#);
+    }
+
+    /// 取最后一个标记：防着正文里引用它
+    #[test]
+    fn strip_reasoning_cuts_before_the_last_marker() {
+        assert_eq!(
+            strip_reasoning("a</think>b</think>c"),
+            "c",
+            "earlier markers are part of the text, not the split point"
+        );
+    }
+
+    /// `settings/test` 当场撞见的形状（#690）：`"OK</think>OK"`
+    #[test]
+    fn strip_reasoning_fixes_the_settings_test_echo() {
+        assert_eq!(strip_reasoning("OK</think>OK"), "OK");
+    }
+
+    /// `{"error": "…"}` 这种把错误直接写成字符串的端点（LM Studio 就是），从前认不出
+    #[test]
+    fn an_error_given_as_a_string_is_forwarded() {
+        let body = serde_json::json!({ "error": "model is unavailable" });
+        assert_eq!(
+            err_detail(&body, ""),
+            "model is unavailable",
+            "a valid error field must not become unknown"
+        );
+    }
+
+    /// OpenAI 形状照旧
+    #[test]
+    fn a_body_with_error_message_still_reads_it() {
+        let body = serde_json::json!({ "error": { "message": "bad request" } });
+        assert_eq!(err_detail(&body, ""), "bad request");
+    }
+
+    /// 截断按字符数：501 个「界」截成 500 个，而不是在某个字的字节中间切开
+    #[test]
+    fn a_long_body_is_truncated() {
+        let raw = "界".repeat(MAX_ERROR_DETAIL_CHARS + 1);
+        let detail = err_detail(&serde_json::Value::Null, &raw);
+        assert_eq!(detail.chars().count(), MAX_ERROR_DETAIL_CHARS);
+    }
 
     /// 真发一次注定失败的请求，拿一个货真价实的 `reqwest::Error`。
     /// 端口 1 上不会有东西监听，而 127.0.0.1 不走代理。
@@ -692,7 +1916,13 @@ mod tests {
         let body = serde_json::json!({
             "error": { "message": "You exceeded your current quota", "code": "insufficient_quota" }
         });
-        let e = failure("LLM", reqwest::StatusCode::TOO_MANY_REQUESTS, None, &body);
+        let e = failure(
+            "LLM",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            None,
+            &body,
+            "",
+        );
         assert!(out_of_credit(&e).is_some(), "该判成欠费");
         assert!(rate_limited(&e).is_none(), "不该判成限流");
     }
@@ -701,7 +1931,13 @@ mod tests {
     #[test]
     fn a_402_is_a_billing_problem() {
         let body = serde_json::json!({ "message": "Sorry, your account balance is insufficient" });
-        let e = failure("LLM", reqwest::StatusCode::PAYMENT_REQUIRED, None, &body);
+        let e = failure(
+            "LLM",
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            None,
+            &body,
+            "",
+        );
         assert!(out_of_credit(&e).is_some());
     }
 
@@ -709,7 +1945,13 @@ mod tests {
     #[test]
     fn a_plain_429_is_still_a_rate_limit() {
         let body = serde_json::json!({ "error": { "message": "TPM limit reached" } });
-        let e = failure("LLM", reqwest::StatusCode::TOO_MANY_REQUESTS, None, &body);
+        let e = failure(
+            "LLM",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            None,
+            &body,
+            "",
+        );
         assert!(rate_limited(&e).is_some());
         assert!(out_of_credit(&e).is_none());
     }
@@ -727,5 +1969,67 @@ mod tests {
     async fn a_clean_api_error_is_a_different_problem() {
         let e = anyhow::anyhow!("LLM request failed (401 Unauthorized): bad key");
         assert!(!is_unreachable(&e));
+    }
+    async fn embeddings_from(data: serde_json::Value) -> anyhow::Result<Vec<Vec<f32>>> {
+        let body = json!({ "data": data }).to_string();
+        let (addr, server) = an_http_response("200 OK", "application/json", &body).await;
+        let result = client_at(addr)
+            .embed(&["first".into(), "second".into()])
+            .await;
+        server.await.unwrap();
+        result
+    }
+
+    /// 写了 index 却取不出数的（`null`、字符串、浮点）按没有索引算。这些形状今天能用，
+    /// 按键判断会把它们送进索引分支再报错，于是整批失败
+    #[tokio::test]
+    async fn an_index_that_is_not_a_number_falls_back_to_position() {
+        for data in [
+            json!([{"index": null, "embedding": [1.0]}, {"index": null, "embedding": [2.0]}]),
+            json!([{"index": "0", "embedding": [1.0]}, {"index": "1", "embedding": [2.0]}]),
+            json!([{"index": 0.5, "embedding": [1.0]}, {"index": 1.5, "embedding": [2.0]}]),
+        ] {
+            let out = embeddings_from(data.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{data} 该按位置配对，却报错：{e}"));
+            assert_eq!(out, vec![vec![1.0], vec![2.0]], "{data}");
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_embeddings_follow_the_input_order() {
+        let out = embeddings_from(json!([
+            {"index": 1, "embedding": [2.0, 20.0]},
+            {"index": 0, "embedding": [1.0, 10.0]}
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, vec![vec![1.0, 10.0], vec![2.0, 20.0]]);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_embedding_indices_are_rejected() {
+        for data in [
+            json!([{"index": 0, "embedding": [1.0]}, {"index": 0, "embedding": [2.0]}]),
+            json!([{"index": 0, "embedding": [1.0]}, {"index": 2, "embedding": [2.0]}]),
+            json!([{"index": 0, "embedding": [1.0]}, {"embedding": [2.0]}]),
+            json!([{"index": 0, "embedding": [1.0]}, {"index": -1, "embedding": [2.0]}]),
+            json!([{"index": 0, "embedding": [1.0]}]),
+        ] {
+            assert!(
+                embeddings_from(data.clone()).await.is_err(),
+                "accepted {data}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn embeddings_without_indices_keep_positional_compatibility() {
+        let out = embeddings_from(json!([
+            {"embedding": [1.0, 10.0]}, {"embedding": [2.0, 20.0]}
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(out, vec![vec![1.0, 10.0], vec![2.0, 20.0]]);
     }
 }

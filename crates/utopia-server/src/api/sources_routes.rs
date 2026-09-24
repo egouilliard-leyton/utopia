@@ -6,7 +6,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
-use utopia_core::models::Role;
+use utopia_core::models::{Role, SOURCE_SECRET_KEYS};
 use uuid::Uuid;
 
 use super::graph_routes::require_kb;
@@ -15,8 +15,48 @@ use crate::error::ApiResult;
 use crate::state::AppState;
 
 /// 生成 api 来源的推送密钥。
-fn new_ingest_token() -> String {
+pub(crate) fn new_ingest_token() -> String {
     format!("utp_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// 推送来的密钥对不对。**常量时间比对。**
+///
+/// 挡的不是计时攻击——这条路上它打不动：密钥是服务端生成的 244 位随机串
+/// （`new_ingest_token`，两个 v4 拼起来），比对又发生在一次数据库往返之后，
+/// 毫秒级的网络与查询抖动盖住的是纳秒级的差异。真正在保护这把密钥的是熵。
+///
+/// 这样写是为了**读代码的人不必重新推一遍上面那段**：仓库里另外两条令牌路径
+/// 都不做明文比对（个人令牌存 sha256 按哈希查，会话走 JWT 验签），这里是唯一
+/// 要拿明文对明文的地方，那就让它自己看起来是想过的。
+///
+/// 长度不等直接返回——`ct_eq` 只对等长切片有意义。密钥长度固定（`utp_` + 64 位
+/// 十六进制），不是秘密的一部分，在这里短路不泄漏任何东西。
+fn push_key_matches(stored: Option<&str>, offered: &str) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    if stored.len() != offered.len() {
+        return false;
+    }
+    use subtle::ConstantTimeEq;
+    stored.as_bytes().ct_eq(offered.as_bytes()).into()
+}
+
+/// 取一条来源，并确认它属于路径上的这个库。
+///
+/// `require_kb` 只查人对库的权限；来源 id 是另一个维度——不比对的话，A 库的
+/// Editor 拿着 B 库来源的 id 就能同步、清理、删除它。不属于就当不存在（404），
+/// 与 `get_token` 一直以来的做法一致
+async fn source_in_kb(
+    state: &AppState,
+    kb_id: Uuid,
+    source_id: Uuid,
+) -> ApiResult<utopia_core::models::Source> {
+    let source = utopia_store::sources::get(&state.pool, source_id).await?;
+    if source.kb_id != kb_id {
+        return Err(utopia_core::AppError::NotFound.into());
+    }
+    Ok(source)
 }
 
 pub async fn list(
@@ -51,6 +91,7 @@ pub async fn create(
     Json(body): Json<CreateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    validate_rss_config(&body.kind, &body.config)?;
     let source = utopia_store::sources::create(
         &state.pool,
         kb_id,
@@ -102,8 +143,8 @@ pub async fn get_token(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    let source = utopia_store::sources::get(&state.pool, source_id).await?;
-    if source.kb_id != kb_id || source.kind != "api" {
+    let source = source_in_kb(&state, kb_id, source_id).await?;
+    if source.kind != "api" {
         return Err(utopia_core::AppError::NotFound.into());
     }
     Ok(Json(json!({ "ingest_token": source.ingest_token })))
@@ -116,8 +157,8 @@ pub async fn rotate_token(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    let source = utopia_store::sources::get(&state.pool, source_id).await?;
-    if source.kb_id != kb_id || source.kind != "api" {
+    let source = source_in_kb(&state, kb_id, source_id).await?;
+    if source.kind != "api" {
         return Err(utopia_core::AppError::NotFound.into());
     }
     let token = new_ingest_token();
@@ -125,12 +166,41 @@ pub async fn rotate_token(
     Ok(Json(json!({ "ingest_token": token })))
 }
 
-/// 响应前剔除凭据（auth_header 只进不出）。
-fn mask_secrets(mut source: utopia_core::models::Source) -> utopia_core::models::Source {
-    if let Some(obj) = source.config.as_object_mut() {
-        obj.remove("auth_header");
+/// 响应前剔除凭据（只进不出；键见 `SOURCE_SECRET_KEYS`）。
+fn mask_secrets(source: utopia_core::models::Source) -> utopia_core::models::Source {
+    source.without_secrets()
+}
+
+fn validate_rss_config(kind: &str, config: &serde_json::Value) -> utopia_core::AppResult<()> {
+    if kind == "rss" {
+        utopia_store::sources::rss_content_mode(config)?;
     }
-    source
+    Ok(())
+}
+
+/// 更新时凭据的合并规则，每个 `SOURCE_SECRET_KEYS` 里的键一样：新配置里**没有**这个键
+/// 或值是空串 → 保留库里的原值（表单留空就是「别动」）；显式 `null` → 删掉；
+/// 其余照新值。响应从不回显，所以客户端没有办法把旧值原样送回来，规则只能长在这里
+fn keep_secrets(next: &mut serde_json::Value, existing: &serde_json::Value) {
+    let Some(obj) = next.as_object_mut() else {
+        return;
+    };
+    for key in SOURCE_SECRET_KEYS {
+        let keep = match obj.get(*key) {
+            None => true,
+            Some(serde_json::Value::Null) => {
+                obj.remove(*key);
+                false
+            }
+            Some(v) => v.as_str().is_some_and(|s| s.trim().is_empty()),
+        };
+        if keep {
+            obj.remove(*key);
+            if let Some(prev) = existing.get(*key) {
+                obj.insert((*key).to_string(), prev.clone());
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -158,23 +228,14 @@ pub async fn update(
     Json(body): Json<UpdateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    // 凭据只进不出：响应从不回显 auth_header，表单留空 = 保留库里原值
+    let existing = source_in_kb(&state, kb_id, source_id).await?;
+    // 凭据只进不出：响应从不回显，表单留空 / 没传 = 保留库里原值
     let mut config = body.config;
     if let Some(cfg) = config.as_mut() {
-        let blank = cfg
-            .get("auth_header")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .is_none_or(|s| s.is_empty());
-        if blank {
-            if let Some(obj) = cfg.as_object_mut() {
-                obj.remove("auth_header");
-                let existing = utopia_store::sources::get(&state.pool, source_id).await?;
-                if let Some(prev) = existing.config.get("auth_header").and_then(|v| v.as_str()) {
-                    obj.insert("auth_header".into(), json!(prev));
-                }
-            }
-        }
+        keep_secrets(cfg, &existing.config);
+    }
+    if let Some(cfg) = config.as_ref() {
+        validate_rss_config(&existing.kind, cfg)?;
     }
     let source = utopia_store::sources::update(
         &state.pool,
@@ -187,7 +248,7 @@ pub async fn update(
     )
     .await?;
     state.emit_source(kb_id);
-    // 审计不落凭据：config 只记除 auth_header 外的键
+    // 审计不落凭据：config 只记「改没改」
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),
@@ -208,9 +269,10 @@ pub async fn cleanup_missing(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    source_in_kb(&state, kb_id, source_id).await?;
     let ids = utopia_store::documents::list_missing(&state.pool, source_id).await?;
     for id in &ids {
-        utopia_store::documents::delete(&state.pool, *id).await?;
+        utopia_store::documents::delete(&state.pool, kb_id, *id, Some(user.id)).await?;
         let search = state.search.clone();
         let did = id.to_string();
         tokio::task::spawn_blocking(move || search.delete_document(&did))
@@ -229,7 +291,7 @@ pub async fn delete(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
     // Memory 来源常驻：记忆空间不因来源整理而蒸发（记忆文档本身可在 Library 删除）
-    let source = utopia_store::sources::get(&state.pool, source_id).await?;
+    let source = source_in_kb(&state, kb_id, source_id).await?;
     if source.kind == utopia_store::memory::MEMORY_SOURCE_KIND {
         return Err(utopia_core::AppError::invalid(
             "memory_source_permanent",
@@ -259,6 +321,7 @@ pub async fn runs(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    source_in_kb(&state, kb_id, source_id).await?;
     let runs = utopia_store::sources::list_runs(&state.pool, source_id, 20).await?;
     Ok(Json(json!({ "runs": runs })))
 }
@@ -269,6 +332,7 @@ pub async fn sync_now(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    source_in_kb(&state, kb_id, source_id).await?;
     let queued = utopia_store::sources::mark_queued(&state.pool, source_id).await?;
     if queued {
         utopia_store::jobs::enqueue(
@@ -285,6 +349,10 @@ pub async fn sync_now(
 #[derive(Deserialize)]
 pub struct IngestBody {
     pub filename: String,
+    /// 墓碑推送（`deleted: true`）可以不带 content——指南一直这么写，而字段
+    /// 从前是必填，缺了就在反序列化那一步被拒。其余情况仍然必填：空串在
+    /// 下面的校验里挡
+    #[serde(default)]
     pub content: String,
     #[serde(default)]
     pub doc_time: Option<DateTime<Utc>>,
@@ -341,14 +409,33 @@ pub async fn ingest(
     Ok(Json(json!({ "action": action_str(action) })))
 }
 
+/// 推送失败的两种性质。**调用方发错了**和**我们这边没接住**得分开：前者记进
+/// run 供集成调试，但不算来源同步失败——来源没坏，是那一次请求不合格；
+/// 后者才该把来源标成 failed 并进告警中心。从前两者都走 `finish_sync(error)`，
+/// 一次格式错误就让铃铛说"来源同步失败，没有新内容进来"
+enum PushError {
+    /// 4xx：负载不合格（JSON 解析、缺字段）
+    Rejected(String),
+    /// 摄入本身失败
+    Failed(String),
+}
+
+impl PushError {
+    fn message(&self) -> &str {
+        match self {
+            PushError::Rejected(m) | PushError::Failed(m) => m,
+        }
+    }
+}
+
 /// 认证之后的推送处理：解析 + 校验 + 摄入/墓碑。错误一律返回文字（记进 run）。
 async fn handle_push(
     state: &AppState,
     source: &utopia_core::models::Source,
     bytes: &[u8],
-) -> Result<crate::ingest_sources::IngestAction, String> {
-    let body: IngestBody =
-        serde_json::from_slice(bytes).map_err(|e| format!("Invalid JSON payload: {e}"))?;
+) -> Result<crate::ingest_sources::IngestAction, PushError> {
+    let body: IngestBody = serde_json::from_slice(bytes)
+        .map_err(|e| PushError::Rejected(format!("Invalid JSON payload: {e}")))?;
     let identity = body
         .external_id
         .as_deref()
@@ -357,7 +444,9 @@ async fn handle_push(
         .unwrap_or_else(|| body.filename.trim())
         .to_string();
     if identity.is_empty() {
-        return Err("external_id or filename is required".into());
+        return Err(PushError::Rejected(
+            "external_id or filename is required".into(),
+        ));
     }
     let key = format!("api:{identity}");
 
@@ -365,12 +454,14 @@ async fn handle_push(
     if body.deleted {
         utopia_store::documents::mark_missing_keys(&state.pool, source.id, &[key])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| PushError::Failed(e.to_string()))?;
         return Ok(crate::ingest_sources::IngestAction::Tombstoned);
     }
 
     if body.filename.trim().is_empty() || body.content.trim().is_empty() {
-        return Err("filename and content are required".into());
+        return Err(PushError::Rejected(
+            "filename and content are required".into(),
+        ));
     }
     let action = crate::ingest_sources::ingest_item(
         state,
@@ -383,11 +474,11 @@ async fn handle_push(
         body.doc_time,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| PushError::Failed(e.to_string()))?;
     // 失而复得：曾被墓碑标记的身份再次正常推送，摘掉 missing 标记
     utopia_store::documents::clear_missing_keys(&state.pool, source.id, &[key])
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| PushError::Failed(e.to_string()))?;
     Ok(action)
 }
 
@@ -413,7 +504,7 @@ pub async fn push(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or(utopia_core::AppError::Unauthorized)?;
-    if source.ingest_token.as_deref() != Some(token) {
+    if !push_key_matches(source.ingest_token.as_deref(), token) {
         return Err(utopia_core::AppError::Unauthorized.into());
     }
 
@@ -434,10 +525,14 @@ pub async fn push(
             state.emit_source(source.kb_id);
             Ok(Json(json!({ "action": action_str(action) })))
         }
-        Err(msg) => {
+        Err(err) => {
+            let msg = err.message().to_string();
             utopia_store::sources::finish_run(&state.pool, run, source.id, Some(&msg), 0, 0)
                 .await?;
-            utopia_store::sources::finish_sync(&state.pool, source.id, Some(&msg), 0).await?;
+            // 只有我们这边没接住才算来源失败；调用方发错了留在 run 历史里就够
+            if let PushError::Failed(_) = err {
+                utopia_store::sources::finish_sync(&state.pool, source.id, Some(&msg), 0).await?;
+            }
             state.emit_source(source.kb_id);
             Err(utopia_core::AppError::Validation(msg).into())
         }
@@ -456,6 +551,15 @@ pub async fn re_extract(
     if source.kb_id != kb_id {
         return Err(utopia_core::AppError::NotFound.into());
     }
+    // `queue_extraction` 自己也会把这种来源的文档滤掉，那样这里回的是「排了 0 篇」。
+    // 点按钮的人该听到的是为什么
+    if !source.extracts() {
+        return Err(utopia_core::AppError::invalid(
+            "source_not_extracted",
+            "Documents under this source are searched, not extracted",
+        )
+        .into());
+    }
     // 任务由 queue_extraction 与状态同事务建好，这里只负责推送
     let ids =
         utopia_store::documents::queue_extraction(&state.pool, kb_id, Some(source_id)).await?;
@@ -473,4 +577,94 @@ pub async fn re_extract(
     )
     .await;
     Ok(Json(json!({ "queued": ids.len() })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keep_secrets, validate_rss_config};
+    use serde_json::json;
+
+    /// 认证判断写反是这类改动唯一值得担心的事（`ct_eq` 给的是 `Choice` 不是
+    /// `bool`，判反一次就是全放行且一切看起来正常），所以两个方向都钉住
+    #[test]
+    fn only_the_key_itself_gets_in() {
+        let key = super::new_ingest_token();
+        assert!(super::push_key_matches(Some(&key), &key));
+        let mut off_by_one = key.clone();
+        off_by_one.pop();
+        off_by_one.push(if key.ends_with('a') { 'b' } else { 'a' });
+        assert!(
+            !super::push_key_matches(Some(&key), &off_by_one),
+            "one character off is not the key"
+        );
+        assert!(
+            !super::push_key_matches(Some(&key), &key[..key.len() - 1]),
+            "a prefix is not the key"
+        );
+        assert!(
+            !super::push_key_matches(Some(&key), &format!("{key}x")),
+            "the key with something after it is not the key"
+        );
+        assert!(
+            !super::push_key_matches(None, &key),
+            "a source that never had a key takes nobody's word"
+        );
+    }
+
+    #[test]
+    fn a_blank_or_missing_secret_keeps_the_stored_one() {
+        let existing = json!({ "bucket": "old", "secret_access_key": "s", "password": "p" });
+        // 没传 → 留；空串 → 留；有值 → 换；null → 删
+        let mut next = json!({ "bucket": "new", "password": "  ", "token": null });
+        keep_secrets(&mut next, &existing);
+        assert_eq!(next["bucket"], "new");
+        assert_eq!(
+            next["secret_access_key"], "s",
+            "missing keeps the stored value"
+        );
+        assert_eq!(next["password"], "p", "blank keeps the stored value");
+        assert!(next.get("token").is_none(), "an explicit null removes it");
+        let mut next = json!({ "secret_access_key": "fresh" });
+        keep_secrets(&mut next, &existing);
+        assert_eq!(next["secret_access_key"], "fresh");
+        assert_eq!(next["password"], "p");
+    }
+
+    #[test]
+    fn no_secret_reaches_a_response() {
+        let source = utopia_core::models::Source {
+            id: uuid::Uuid::nil(),
+            kb_id: uuid::Uuid::nil(),
+            kind: "s3".into(),
+            name: "s".into(),
+            config: json!({ "bucket": "b", "access_key_id": "AKIA", "secret_access_key": "x",
+                            "account_key": "y", "service_account_key": "z", "password": "w",
+                            "token": "t", "auth_header": "h" }),
+            icon: None,
+            sync_interval_minutes: None,
+            sync_cron: None,
+            last_sync_at: None,
+            last_sync_status: "never".into(),
+            last_sync_error: None,
+            last_sync_added: 0,
+            ingest_token: Some("utp_x".into()),
+            created_at: chrono::Utc::now(),
+        };
+        let masked = super::mask_secrets(source);
+        let obj = masked.config.as_object().unwrap();
+        for key in utopia_core::models::SOURCE_SECRET_KEYS {
+            assert!(!obj.contains_key(*key), "{key} leaked");
+        }
+        assert_eq!(obj["bucket"], "b");
+        assert_eq!(
+            obj["access_key_id"], "AKIA",
+            "an identifier is not a secret"
+        );
+    }
+
+    #[test]
+    fn invalid_rss_content_mode_is_rejected_at_the_route_boundary() {
+        assert!(validate_rss_config("rss", &json!({ "content_mode": "all" })).is_err());
+        assert!(validate_rss_config("url", &json!({ "content_mode": "all" })).is_ok());
+    }
 }

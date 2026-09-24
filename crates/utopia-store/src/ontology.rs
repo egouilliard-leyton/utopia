@@ -42,7 +42,7 @@ pub async fn entity_instances(
                    AND f.invalidated_at IS NULL) AS fact_count
          FROM entities e
          WHERE e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL
-         ORDER BY lower(e.canonical_name)
+         ORDER BY lower(e.canonical_name), e.id
          LIMIT $3 OFFSET $4",
     )
     .bind(kb_id)
@@ -82,6 +82,8 @@ pub async fn relation_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Re
                       WHERE d.relation_type_id = r.id) AS domains,
                 ARRAY(SELECT g.entity_type_id FROM relation_type_ranges g
                       WHERE g.relation_type_id = r.id) AS ranges,
+                ARRAY(SELECT q.qualifier_type_id FROM relation_type_qualifiers q
+                      WHERE q.relation_type_id = r.id) AS qualifiers,
                 (SELECT count(*) FROM facts f
                  WHERE f.predicate_id = r.id AND f.invalidated_at IS NULL) AS usage
          FROM relation_types r WHERE r.kb_id = $1 ORDER BY lower(r.label)",
@@ -89,6 +91,36 @@ pub async fn relation_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Re
     .bind(kb_id)
     .fetch_all(pool)
     .await?)
+}
+
+/// 谓词的显示名统一成**小驼峰**（见迁移 0042）。
+///
+/// 类是大驼峰、谓词是小驼峰，这是 RDF/OWL 与 schema.org 的惯例，而且大小写
+/// 本身就在说这个词是类还是属性。库里同时存在 `acceptedAnswer`、`access to`、
+/// `ApplicableCertificate` 三种写法，在同一列里读起来就是没规矩。
+///
+/// **只动分隔符与首字母，不碰词内部的大小写**：`productID`、`hasLEI`、
+/// `accessibilityAPI` 要原样留着。从 `key` 反推是做不到这一点的——`to_key`
+/// 在连续大写之间不插下划线，`product_id` 拼回去只会得到 `productId`。
+pub fn lower_camel(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut start_of_word = false;
+    for c in label.trim().chars() {
+        if c == ' ' || c == '_' || c == '-' {
+            // 连着几个分隔符只算一次，词首标记留着
+            start_of_word = !out.is_empty();
+            continue;
+        }
+        if out.is_empty() {
+            out.extend(c.to_lowercase());
+        } else if start_of_word {
+            out.extend(c.to_uppercase());
+            start_of_word = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn validate_key(key: &str) -> AppResult<()> {
@@ -161,7 +193,7 @@ pub async fn update_entity_type(
     validate_shape(shape)?;
     let res = sqlx::query(
         "UPDATE entity_types SET label = $3, color = COALESCE($4, color), shape = $5,
-                description = $6
+                description = $6, updated_at = now()
          WHERE id = $2 AND kb_id = $1",
     )
     .bind(kb_id)
@@ -387,6 +419,7 @@ pub async fn create_relation_type(
         ));
     }
     validate_attribute_fields(kind, domains, datatype)?;
+    let label = &lower_camel(label);
     // 新建的行 id 还不存在，指向自己无从谈起——所以 self_id 传 None
     validate_property_links(pool, kb_id, None, kind, ax).await?;
     let is_attr = kind == "attribute";
@@ -465,6 +498,99 @@ async fn set_domains_ranges(
     Ok(())
 }
 
+/// 一条关系声明自己的边能带哪些属性（0037）。覆盖式写入，与 domain / range 同一套。
+///
+/// 两条校验都在这里，CHECK 引不到别的行：同库，且每一个都是 `kind = 'attribute'`
+/// ——边上的属性是字面值，复用的正是属性定义的 datatype / unit / 换算。
+/// 一个关系不能把自己声明成自己的属性（DB 有 CHECK，这里给人话）。
+pub async fn set_relation_qualifiers(
+    pool: &PgPool,
+    kb_id: Uuid,
+    relation_type_id: Uuid,
+    qualifier_type_ids: &[Uuid],
+) -> AppResult<()> {
+    if qualifier_type_ids.contains(&relation_type_id) {
+        return Err(AppError::invalid(
+            "qualifier_is_self",
+            "A relation cannot be its own qualifier",
+        ));
+    }
+    if !qualifier_type_ids.is_empty() {
+        let (ok,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM relation_types
+             WHERE kb_id = $1 AND kind = 'attribute' AND id = ANY($2)",
+        )
+        .bind(kb_id)
+        .bind(qualifier_type_ids)
+        .fetch_one(pool)
+        .await?;
+        if ok as usize != qualifier_type_ids.len() {
+            return Err(AppError::invalid(
+                "qualifier_not_attribute",
+                "Every qualifier must be an attribute of this base",
+            ));
+        }
+    }
+    sqlx::query("DELETE FROM relation_type_qualifiers WHERE relation_type_id = $1")
+        .bind(relation_type_id)
+        .execute(pool)
+        .await?;
+    if !qualifier_type_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO relation_type_qualifiers (relation_type_id, qualifier_type_id)
+             SELECT $1, x FROM unnest($2::uuid[]) AS x
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(relation_type_id)
+        .bind(qualifier_type_ids)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// 给一条关系**追加**一个边上的属性声明（0037）。
+///
+/// 与 `set_relation_qualifiers` 的覆盖式不同：抽取时几篇文档并行，各自从语料里
+/// 补声明，覆盖式写入会把别人刚补的冲掉（实测 `round` 补过又没了）。
+/// 这里只加不删，撞上已有的什么都不做。校验与覆盖式同一套。
+pub async fn add_relation_qualifier(
+    pool: &PgPool,
+    kb_id: Uuid,
+    relation_type_id: Uuid,
+    qualifier_type_id: Uuid,
+) -> AppResult<()> {
+    if relation_type_id == qualifier_type_id {
+        return Err(AppError::invalid(
+            "qualifier_is_self",
+            "A relation cannot be its own qualifier",
+        ));
+    }
+    let (ok,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM relation_types
+         WHERE kb_id = $1 AND kind = 'attribute' AND id = $2",
+    )
+    .bind(kb_id)
+    .bind(qualifier_type_id)
+    .fetch_one(pool)
+    .await?;
+    if ok != 1 {
+        return Err(AppError::invalid(
+            "qualifier_not_attribute",
+            "Every qualifier must be an attribute of this base",
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO relation_type_qualifiers (relation_type_id, qualifier_type_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(relation_type_id)
+    .bind(qualifier_type_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn update_relation_type(
     pool: &PgPool,
@@ -481,6 +607,23 @@ pub async fn update_relation_type(
     domains: Option<&[Uuid]>,
     ranges: Option<&[Uuid]>,
 ) -> AppResult<()> {
+    // 名字属性是内建的（0041）：标成 functional 会让每个第二个名字都成一条冲突、
+    // 甚至把本名关掉；改名、改时态也一样没有正当用途
+    let name_attribute: Option<(bool,)> = sqlx::query_as(
+        "SELECT builtin AND key = 'known_as' FROM relation_types WHERE id = $1 AND kb_id = $2",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .fetch_optional(pool)
+    .await?;
+    if name_attribute == Some((true,)) {
+        return Err(AppError::invalid(
+            "builtin_name_attribute",
+            "The name attribute is built in and cannot be edited",
+        ));
+    }
+    // 改名也归一：不然界面上改一次就能把小驼峰改回 "access to"
+    let label = &lower_camel(label);
     if !matches!(temporal, "state" | "event" | "eternal") {
         return Err(AppError::Validation(
             "temporal must be state / event / eternal".into(),
@@ -518,7 +661,7 @@ pub async fn update_relation_type(
                 unit = CASE WHEN kind = 'attribute' THEN $9 ELSE unit END,
                 is_transitive = $10, is_symmetric = $11,
                 is_asymmetric = $12, is_irreflexive = $13,
-                inverse_of = $14, sub_property_of = $15
+                inverse_of = $14, sub_property_of = $15, updated_at = now()
          WHERE id = $2 AND kb_id = $1",
     )
     .bind(kb_id)
@@ -749,7 +892,8 @@ pub async fn update_type_from_import(
          SET label = $3,
              -- 空描述不覆盖已有的：上游可能没写 rdfs:comment，而本地可能
              -- 已经被人按自己的语料调过，那份调整比空值有价值
-             description = CASE WHEN $4 = '' THEN description ELSE $4 END
+             description = CASE WHEN $4 = '' THEN description ELSE $4 END,
+             updated_at = now()
          WHERE kb_id = $1 AND iri = $2 RETURNING id",
     )
     .bind(kb_id)
@@ -987,49 +1131,64 @@ pub async fn types_needing_embedding(
     model: &str,
     only: Option<TypeKind>,
 ) -> AppResult<Vec<TypeToEmbed>> {
-    let mut out = Vec::new();
     if only == Some(TypeKind::Relation) {
         // 类型消解只用类，等 1633 个关系嵌完是白等六分钟
         return relations_needing_embedding(pool, kb_id, model).await;
     }
-    let ents: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, label, coalesce(description, '') FROM entity_types
-         WHERE kb_id = $1
-           AND (embedding IS NULL
-                OR embedded_model IS DISTINCT FROM $2
-                OR embedded_text IS DISTINCT FROM
-                   CASE WHEN coalesce(btrim(description), '') = '' THEN btrim(label)
-                        ELSE btrim(label) || E'\n' || btrim(description) END)",
+    // **陈不陈，用生成原文的同一个函数判**（#672）。从前在 SQL 里用 `btrim` 把这段字
+    // 重拼一遍再比，而 `embed_text` 用的是 Rust 的 `trim`：`btrim` 只去空格，`trim`
+    // 连换行、制表符一起去。schema.org 的描述结尾是 "\n      "，这些行存下的原文与
+    // SQL 拼出来的永远不等，于是每轮都判成陈的——补齐任务把同一批行一遍遍重嵌，
+    // 抽取门控（#526）等一个永远补不齐的索引，直到期限把文档判失败。
+    // 与 `mappings::needing_embedding` 同一个教训：拉回来在 Rust 里比
+    let rows: Vec<StoredEmbedding> = sqlx::query_as(
+        "SELECT id, label, coalesce(description, '') AS description,
+                embedding IS NOT NULL AS embedded, embedded_model, embedded_text,
+                label_embedding IS NOT NULL AS label_embedded, label_embedded_model, label_embedded_text
+           FROM entity_types
+          WHERE kb_id = $1",
     )
     .bind(kb_id)
-    .bind(model)
     .fetch_all(pool)
     .await?;
-    out.extend(ents.into_iter().map(|(id, label, desc)| TypeToEmbed {
-        id,
-        kind: TypeKind::Entity,
-        text: embed_text(&label, &desc),
-        field: EmbedField::Full,
-    }));
-    // 只嵌 label 的那一份（见 `entity_types.label_embedding`）。短查询走这个索引——查询分了两种形状，
-    // 文档也得分两种，否则短查询被同义反复的类接管
-    let labels: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, label FROM entity_types
-         WHERE kb_id = $1
-           AND (label_embedding IS NULL
-                OR label_embedded_model IS DISTINCT FROM $2
-                OR label_embedded_text IS DISTINCT FROM btrim(label))",
-    )
-    .bind(kb_id)
-    .bind(model)
-    .fetch_all(pool)
-    .await?;
-    out.extend(labels.into_iter().map(|(id, label)| TypeToEmbed {
-        id,
-        kind: TypeKind::Entity,
-        text: label.trim().to_string(),
-        field: EmbedField::Label,
-    }));
+    let mut full = Vec::new();
+    let mut labels = Vec::new();
+    for r in rows {
+        let text = embed_text(&r.label, &r.description);
+        if is_stale(
+            r.embedded,
+            r.embedded_model.as_deref(),
+            r.embedded_text.as_deref(),
+            model,
+            &text,
+        ) {
+            full.push(TypeToEmbed {
+                id: r.id,
+                kind: TypeKind::Entity,
+                text,
+                field: EmbedField::Full,
+            });
+        }
+        // 只嵌 label 的那一份（见 `entity_types.label_embedding`）。短查询走这个索引——查询分了两种形状，
+        // 文档也得分两种，否则短查询被同义反复的类接管
+        let short = r.label.trim().to_string();
+        if is_stale(
+            r.label_embedded,
+            r.label_embedded_model.as_deref(),
+            r.label_embedded_text.as_deref(),
+            model,
+            &short,
+        ) {
+            labels.push(TypeToEmbed {
+                id: r.id,
+                kind: TypeKind::Entity,
+                text: short,
+                field: EmbedField::Label,
+            });
+        }
+    }
+    let mut out = full;
+    out.extend(labels);
     if only == Some(TypeKind::Entity) {
         return Ok(out);
     }
@@ -1042,28 +1201,67 @@ async fn relations_needing_embedding(
     kb_id: Uuid,
     model: &str,
 ) -> AppResult<Vec<TypeToEmbed>> {
-    let mut out = Vec::new();
-    let rels: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, label, coalesce(description, '') FROM relation_types
-         WHERE kb_id = $1
-           AND (embedding IS NULL
-                OR embedded_model IS DISTINCT FROM $2
-                OR embedded_text IS DISTINCT FROM
-                   CASE WHEN coalesce(btrim(description), '') = '' THEN btrim(label)
-                        ELSE btrim(label) || E'\n' || btrim(description) END)",
+    // 判据同上（#672）：在 Rust 里用 `embed_text` 比，不在 SQL 里重拼。关系只有整段
+    // 那一份向量，label 那三列补空。
+    //
+    // 名字属性不嵌（0041）：没有向量就不会被最近邻检索出来，本体提议、属性归并、
+    // 抽取时的候选清单都碰不到它——名字只走抽取回复里的 `names` 那一条路
+    let rows: Vec<StoredEmbedding> = sqlx::query_as(
+        "SELECT id, label, coalesce(description, '') AS description,
+                embedding IS NOT NULL AS embedded, embedded_model, embedded_text,
+                false AS label_embedded, NULL::text AS label_embedded_model,
+                NULL::text AS label_embedded_text
+           FROM relation_types
+          WHERE kb_id = $1 AND NOT (builtin AND key = 'known_as')",
     )
     .bind(kb_id)
-    .bind(model)
     .fetch_all(pool)
     .await?;
-    out.extend(rels.into_iter().map(|(id, label, desc)| TypeToEmbed {
-        id,
-        kind: TypeKind::Relation,
-        text: embed_text(&label, &desc),
-        // 关系没有短查询那一路,只有整段这一份
-        field: EmbedField::Full,
-    }));
-    Ok(out)
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let text = embed_text(&r.label, &r.description);
+            is_stale(
+                r.embedded,
+                r.embedded_model.as_deref(),
+                r.embedded_text.as_deref(),
+                model,
+                &text,
+            )
+            .then_some(TypeToEmbed {
+                id: r.id,
+                kind: TypeKind::Relation,
+                text,
+                // 关系没有短查询那一路,只有整段这一份
+                field: EmbedField::Full,
+            })
+        })
+        .collect())
+}
+
+/// 类型那一行上两份向量的现状，判陈用
+#[derive(sqlx::FromRow)]
+struct StoredEmbedding {
+    id: Uuid,
+    label: String,
+    description: String,
+    embedded: bool,
+    embedded_model: Option<String>,
+    embedded_text: Option<String>,
+    label_embedded: bool,
+    label_embedded_model: Option<String>,
+    label_embedded_text: Option<String>,
+}
+
+/// 没嵌过、换了模型、或者当时嵌的原文与现在要嵌的不一样
+fn is_stale(
+    embedded: bool,
+    stored_model: Option<&str>,
+    stored_text: Option<&str>,
+    model: &str,
+    text: &str,
+) -> bool {
+    !embedded || stored_model != Some(model) || stored_text != Some(text)
 }
 
 /// 回写向量，连同"嵌的是哪段字、用的哪个模型"。三者必须同一次写入——
@@ -1204,18 +1402,62 @@ pub async fn nearest_relation_types(
 ///
 /// 不区分 kind：属性与关系同住一张表且共用 key 命名空间，调用方拿到 id 之后
 /// 该怎么用它自己清楚（改写事实时谓词就是谓词）。
+///
+/// 名字属性找不到（0041）：把一批「简称」「former_name」的值事实归并到 `known_as`
+/// 上，等于绕开了名字的核对与配对，所以这条路不给它
 pub async fn relation_type_id_by_key(
     pool: &PgPool,
     kb_id: Uuid,
     key: &str,
 ) -> AppResult<Option<Uuid>> {
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM relation_types WHERE kb_id = $1 AND key = $2")
-            .bind(kb_id)
-            .bind(key)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM relation_types
+              WHERE kb_id = $1 AND key = $2 AND NOT (builtin AND key = 'known_as')",
+    )
+    .bind(kb_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|(id,)| id))
+}
+
+/// 一个**从没当关系用过**的关系，改判成属性。改成了返回 true。
+///
+/// 冷启动认出某个说法该是属性、去建的时候，键可能已经被一个同名关系占着
+/// （实测：`Relation key 'valuation' already exists`，然后整批放弃，那些数
+/// 永远拿不到谓词）。可占着这个键的关系常常是空的——本体包带进来的、或者
+/// 早先按票数建的，一条事实都没挂上。空的关系改判不破坏任何东西：
+/// 没有边会因此断，撤销也只是再改回去。
+///
+/// **有事实的一律不动**。`invested`、`raised` 这类既连实体又带数额的，
+/// 改判会把已有的边连根拔起；那是本体与语料的真分歧，该留给人看，
+/// 不该由冷启动替人决定。
+pub async fn attribute_from_unused_relation(
+    pool: &PgPool,
+    kb_id: Uuid,
+    key: &str,
+    domains: &[Uuid],
+    datatype: &str,
+    unit: Option<&str>,
+) -> AppResult<Option<Uuid>> {
+    validate_attribute_fields("attribute", domains, Some(datatype))?;
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE relation_types SET kind = 'attribute', datatype = $3, unit = $4,
+                inverse_of = NULL, sub_property_of = NULL
+         WHERE kb_id = $1 AND key = $2 AND kind = 'relation'
+           AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.predicate_id = relation_types.id)
+         RETURNING id",
+    )
+    .bind(kb_id)
+    .bind(key)
+    .bind(datatype)
+    .bind(unit)
+    .fetch_optional(pool)
+    .await?;
+    let Some((id,)) = row else { return Ok(None) };
+    // domain / range 在各自的表里，不是列。属性没有 range——值域落在 datatype 上
+    set_domains_ranges(pool, id, domains, &[]).await?;
+    Ok(Some(id))
 }
 
 /// 一个属性声明的 datatype。改写字面值事实时要按它换算。
@@ -1255,7 +1497,7 @@ pub async fn adopt_iri_onto_key(
     iri: &str,
 ) -> AppResult<Option<Uuid>> {
     let row: Option<(Uuid,)> = sqlx::query_as(
-        "UPDATE entity_types SET iri = $3, shape = 'square'
+        "UPDATE entity_types SET iri = $3, shape = 'square', updated_at = now()
          WHERE kb_id = $1 AND key = $2 AND iri IS NULL
          RETURNING id",
     )
@@ -1292,6 +1534,46 @@ pub async fn nearest_entity_type_ids(
 }
 
 /// 同上，关系与属性。`only_kind` 分道：关系清单与属性清单在提示词里是两段。
+/// 同上，但**只在 domain 落在这批类上的那些关系里**检索。
+///
+/// 存在的理由：全库检索对关系几乎没有区分度（1500 字的分块向量 vs 几个词的
+/// 关系标签，距离全挤在一条窄带里）。实测一块讲「Jensen Huang, founder and CEO
+/// of NVIDIA」的正文，`founder` 排 267、`job_title` 排 618（共 1026）——两个都进不了
+/// 前 30 的窗口，于是模型没有地方写职务，索性不写。**不是抽错，是没被问到。**
+///
+/// 把池子先按 domain 收窄到「这一块认出来的那些类身上声明的关系」，同一块里
+/// `founder` 升到 29、`job_title` 升到 55（共 86）。收窄靠的是本体自己声明的
+/// 结构，不是又一个相似度模型。
+pub async fn nearest_relation_type_ids_in_domains(
+    pool: &PgPool,
+    kb_id: Uuid,
+    embedding: &[f32],
+    limit: i64,
+    only_kind: Option<&str>,
+    domains: &[Uuid],
+) -> AppResult<Vec<Uuid>> {
+    if domains.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT r.id FROM relation_types r
+         WHERE r.kb_id = $1 AND r.embedding IS NOT NULL
+           AND ($4::text IS NULL OR r.kind = $4)
+           AND EXISTS (SELECT 1 FROM relation_type_domains d
+                       WHERE d.relation_type_id = r.id AND d.entity_type_id = ANY($5))
+         ORDER BY r.embedding <=> $2
+         LIMIT $3",
+    )
+    .bind(kb_id)
+    .bind(Vector::from(embedding.to_vec()))
+    .bind(limit)
+    .bind(only_kind)
+    .bind(domains)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 pub async fn nearest_relation_type_ids(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1409,7 +1691,10 @@ pub async fn create_relation_types_bulk(
         validate_key(&r.key)?;
     }
     let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
-    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    // 导入来的词表自己就可能不一致（unece.org 里 `brandName` 与
+    // `ApplicableCertificate` 并存）——落库前统一，真身留在 `iri` 里
+    let camel: Vec<String> = rows.iter().map(|r| lower_camel(&r.label)).collect();
+    let labels: Vec<&str> = camel.iter().map(String::as_str).collect();
     let descs: Vec<&str> = rows.iter().map(|r| r.description.as_str()).collect();
     let iris: Vec<&str> = rows.iter().map(|r| r.iri.as_str()).collect();
     let kinds: Vec<&str> = rows.iter().map(|r| r.kind).collect();
@@ -1768,6 +2053,81 @@ pub async fn entity_fits_domain(
     Ok((declared > 0).then_some(ok > 0))
 }
 
+/// 一条 (主语, 谓词, 宾语) 对着谓词的 domain 签名该怎么落。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// 谓词没声明 domain——没有判据，照原样落
+    Unchecked,
+    /// 主语符合
+    Keep,
+    /// 主语不符合、宾语符合：按签名对调主宾
+    Swap,
+    /// 两边都不符合：这个关系不适用于这对实体，谓词该留空
+    Neither,
+}
+
+/// **三条写谓词的路共用的那一道判断**（#190 / #196）：抽取落新事实、采纳把谓词
+/// 挂回旧事实、合并换掉主语——从前只有抽取查，另外两条各自绕了过去。
+///
+/// 判据刻意窄（0012）：只看签名，只在**正向违反而反向成立**时对调，两个方向都
+/// 对不上就留空谓词。参数顺序不是关于世界的断言，是这个 key 的编码约定，所以本体
+/// 在这一处是执法的；哪些类型能参与仍是引导，不在这里裁。
+///
+/// **range 也算进来**（#222）。从前只看 domain：`headOf` 的 domain 是 Agent，
+/// schema.org 里 Project 也是 Organization 也是 Agent，于是 `Project Aurora head_of
+/// Li Ting` 主语过关就 Keep，宾语是个人、range 要 Organization 这件事没人看。
+/// 现在两端各看各的：正向两端都不违反才 Keep；否则反过来两端都不违反才 Swap。
+/// 没判出类型的实体在 range 这一端不算违反（"不知道"不是"不符合"，与
+/// `signature_breaks` 同一条纪律）；domain 那一端沿用旧规矩，那是 0012 定下的
+pub async fn judge_direction(
+    pool: &PgPool,
+    relation_type_id: Uuid,
+    subject_id: Uuid,
+    object_id: Uuid,
+) -> AppResult<Fit> {
+    let subject_in_domain = entity_fits_domain(pool, relation_type_id, subject_id).await?;
+    let object_in_range = entity_fits_range(pool, relation_type_id, object_id).await?;
+    if subject_in_domain.is_none() && object_in_range.is_none() {
+        return Ok(Fit::Unchecked);
+    }
+    if subject_in_domain != Some(false) && object_in_range != Some(false) {
+        return Ok(Fit::Keep);
+    }
+    let object_in_domain = entity_fits_domain(pool, relation_type_id, object_id).await?;
+    let subject_in_range = entity_fits_range(pool, relation_type_id, subject_id).await?;
+    if object_in_domain != Some(false) && subject_in_range != Some(false) {
+        return Ok(Fit::Swap);
+    }
+    Ok(Fit::Neither)
+}
+
+/// [`entity_fits_domain`] 的 range 版。多一条规矩：实体还没判出类型 → None，
+/// 不当违反——range 这一端是新加的判据（#222），不该让未分类实体的事实因此
+/// 丢掉谓词
+pub async fn entity_fits_range(
+    pool: &PgPool,
+    relation_type_id: Uuid,
+    entity_id: Uuid,
+) -> AppResult<Option<bool>> {
+    let (declared, typed, ok): (i64, bool, i64) = sqlx::query_as(
+        "WITH RECURSIVE up(id) AS (
+             SELECT type_id FROM entities WHERE id = $2
+             UNION
+             SELECT p.parent_id FROM entity_type_parents p JOIN up ON p.child_id = up.id
+         )
+         SELECT (SELECT count(*) FROM relation_type_ranges WHERE relation_type_id = $1),
+                (SELECT type_id IS NOT NULL FROM entities WHERE id = $2),
+                (SELECT count(*) FROM relation_type_ranges g
+                   JOIN up ON up.id = g.entity_type_id
+                  WHERE g.relation_type_id = $1)",
+    )
+    .bind(relation_type_id)
+    .bind(entity_id)
+    .fetch_one(pool)
+    .await?;
+    Ok((declared > 0 && typed).then_some(ok > 0))
+}
+
 /// 把 `owl:inverseOf` / `rdfs:subPropertyOf` 从 IRI 解析成 id。
 ///
 /// **必须是第二遍。** 这两条指的是另一个关系类型，而 id 要等全部插完才有——
@@ -1809,4 +2169,57 @@ pub async fn link_property_axioms_bulk(
     let inv = run("inverse_of", inverse).await?;
     let sub = run("sub_property_of", sub_property).await?;
     Ok((inv, sub))
+}
+
+#[cfg(test)]
+mod name_shape_tests {
+    use super::lower_camel;
+
+    #[test]
+    fn separators_become_camel_humps() {
+        assert_eq!(lower_camel("access to"), "accessTo");
+        assert_eq!(lower_camel("collaborated with"), "collaboratedWith");
+        assert_eq!(lower_camel("works_for"), "worksFor");
+        assert_eq!(lower_camel("date-applicability"), "dateApplicability");
+        // 连着几个分隔符只算一次
+        assert_eq!(lower_camel("called   for"), "calledFor");
+        assert_eq!(lower_camel("  start date  "), "startDate");
+    }
+
+    #[test]
+    fn only_the_first_letter_is_lowered() {
+        assert_eq!(
+            lower_camel("ApplicableCertificate"),
+            "applicableCertificate"
+        );
+        assert_eq!(lower_camel("EffectiveEndDateTime"), "effectiveEndDateTime");
+    }
+
+    /// **这条是这个函数存在的理由之一**：从 `key` 反推做不到，
+    /// `product_id` 拼回去只会得到 `productId`
+    #[test]
+    fn acronyms_are_left_alone() {
+        assert_eq!(lower_camel("productID"), "productID");
+        assert_eq!(lower_camel("hasLEI"), "hasLEI");
+        assert_eq!(lower_camel("accessibilityAPI"), "accessibilityAPI");
+        assert_eq!(
+            lower_camel("checkoutPageURLTemplate"),
+            "checkoutPageURLTemplate"
+        );
+    }
+
+    #[test]
+    fn already_right_is_untouched() {
+        for s in ["owns", "acceptedAnswer", "worksFor", "3DModel"] {
+            assert_eq!(lower_camel(s), s, "{s} 不该被动");
+        }
+    }
+
+    #[test]
+    fn idempotent() {
+        for s in ["access to", "ApplicableCertificate", "productID", "owns"] {
+            let once = lower_camel(s);
+            assert_eq!(lower_camel(&once), once, "{s} 归一两次结果要一样");
+        }
+    }
 }
